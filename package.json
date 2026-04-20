@@ -1,0 +1,20 @@
+{
+  "name": "pastoral-update-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for connect group pastoral updates, backed by Google Sheets",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "fuse.js": "^7.0.0",
+    "googleapis": "^144.0.0",
+    "grammy": "^1.31.0",
+    "ulid": "^2.3.0"
+  }
+}
