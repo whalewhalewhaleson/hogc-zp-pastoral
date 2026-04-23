@@ -40,6 +40,20 @@ async function showTyping(ctx) {
   try { await ctx.replyWithChatAction('typing'); } catch {}
 }
 
+const TITLE_MAX_CHARS = 100;
+
+function normalizeTitle(raw) {
+  const t = String(raw ?? '').trim();
+  if (!t) return '';
+  return t.length > TITLE_MAX_CHARS ? t.slice(0, TITLE_MAX_CHARS) : t;
+}
+
+// Format a note record for list/detail rendering.
+// Returns MarkdownV2-safe strings.
+function renderNoteTitleLine(title) {
+  return title ? `*${e(title)}*\n\n` : '';
+}
+
 // ---------------------------------------------------------------------------
 // Auth guard
 // ---------------------------------------------------------------------------
@@ -111,6 +125,60 @@ bot.command('help', (ctx) => ctx.reply(HELP_TEXT, { parse_mode: 'MarkdownV2' }))
 bot.command('cancel', (ctx) => {
   ctx.session.pending = null;
   return ctx.reply('No worries, cancelled! 🙂');
+});
+
+bot.command('skip', async (ctx) => {
+  const pending = ctx.session.pending;
+  if (!pending) return ctx.reply('Nothing to skip right now. 😊');
+
+  if (pending.kind === 'update_title') {
+    const member = getMember(pending.memberId);
+    if (!member) {
+      ctx.session.pending = null;
+      return ctx.reply(`Hmm, that member no longer exists. Cancelled 😕`);
+    }
+    ctx.session.pending = { kind: 'update_body', memberId: pending.memberId, title: '' };
+    return ctx.reply(
+      `No title — now type the note for *${e(memberLabel(member))}* \\(or /cancel\\)\\.`,
+      { parse_mode: 'MarkdownV2' },
+    );
+  }
+
+  if (pending.kind === 'update_body') {
+    return ctx.reply(`The note itself can't be skipped — go ahead and type it, or /cancel. 😊`);
+  }
+
+  if (pending.kind === 'edit_title') {
+    ctx.session.pending = {
+      kind: 'edit_body',
+      updateId: pending.updateId,
+      newTitle: pending.currentTitle,
+      currentBody: pending.currentBody,
+    };
+    return ctx.reply(
+      `Keeping the current title\\. Now send the updated note, or /skip to keep the old one, or /cancel\\.`,
+      { parse_mode: 'MarkdownV2' },
+    );
+  }
+
+  if (pending.kind === 'edit_body') {
+    await showTyping(ctx);
+    const row = await findUpdateRow(pending.updateId);
+    const gate = checkEditGate(ctx, row);
+    if (gate) {
+      ctx.session.pending = null;
+      return ctx.reply(gate);
+    }
+    await updateRow('_updates', row._rowIndex, {
+      title: pending.newTitle,
+      edited_at: toSGTIso(),
+    });
+    ctx.session.pending = null;
+    ctx.session.recentList = null;
+    return ctx.reply(`Done\\! Only the title changed\\. ✏️`, { parse_mode: 'MarkdownV2' });
+  }
+
+  return ctx.reply('Nothing to skip right now. 😊');
 });
 
 // ---------------------------------------------------------------------------
@@ -194,9 +262,9 @@ bot.command('update', async (ctx) => {
   }
   if (matches.length === 1) {
     const m = matches[0];
-    ctx.session.pending = { kind: 'update_note', memberId: m.memberId };
+    ctx.session.pending = { kind: 'update_title', memberId: m.memberId };
     return ctx.reply(
-      `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your note, or /cancel if you change your mind\\.`,
+      `Writing a note for *${e(memberLabel(m))}* 📝\nWhat's this note about? \\(short title, or /skip — /cancel to back out\\)`,
       { parse_mode: 'MarkdownV2' },
     );
   }
@@ -257,9 +325,9 @@ bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
     return sendHistory(ctx, m.memberId);
   }
 
-  ctx.session.pending = { kind: 'update_note', memberId: m.memberId };
+  ctx.session.pending = { kind: 'update_title', memberId: m.memberId };
   await ctx.reply(
-    `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your note, or /cancel if you change your mind\\.`,
+    `Writing a note for *${e(memberLabel(m))}* 📝\nWhat's this note about? \\(short title, or /skip — /cancel to back out\\)`,
     { parse_mode: 'MarkdownV2' },
   );
 });
@@ -270,7 +338,8 @@ async function showUpdateDetail(ctx, r) {
   const date = e(formatSGTDate(r.timestamp));
   const author = e(r.author_name || String(r.author_tg_id));
   const edited = r.edited_at ? ' _\\(edited\\)_' : '';
-  const text = `*${e(memberName)}*\n${date} · ${author}${edited}\n\n${e(r.note)}`;
+  const titleLine = renderNoteTitleLine(r.title);
+  const text = `*${e(memberName)}*\n${date} · ${author}${edited}\n\n${titleLine}${e(r.note)}`;
   const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
   const opts = { parse_mode: 'MarkdownV2' };
   if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
@@ -356,8 +425,9 @@ async function sendHistory(ctx, memberId) {
     const date = e(formatSGTDate(r.timestamp));
     const author = e(r.author_name || String(r.author_tg_id));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+    const titleLine = r.title ? `*${e(r.title)}*\n` : '';
     const preview = e(String(r.note).slice(0, 40).replace(/\n/g, ' ') + (r.note.length > 40 ? '…' : ''));
-    text += `/${i + 1} ${date} · ${author}${edited}\n_${preview}_\n\n`;
+    text += `/${i + 1} ${date} · ${author}${edited}\n${titleLine}_${preview}_\n\n`;
   });
   text += `Reply /1–/${filtered.length} to read, or /cancel\\.`;
   ctx.session.pending = { kind: 'pick_update', updates: filtered };
@@ -399,8 +469,9 @@ function renderRecentList(mine, offset) {
     const memberName = e(member ? memberLabel(member) : String(r.member_id));
     const date = e(formatSGTDate(r.timestamp));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+    const titleLine = r.title ? `*${e(r.title)}*\n` : '';
     const preview = e(String(r.note).slice(0, 80).replace(/\n/g, ' ') + (r.note.length > 80 ? '…' : ''));
-    text += `*${i + 1}\\.* 📝 *${memberName}* · ${date}${edited}\n_${preview}_\n\n`;
+    text += `*${i + 1}\\.* 📝 *${memberName}* · ${date}${edited}\n${titleLine}_${preview}_\n\n`;
   });
   text += `Tap a number to open\\.`;
 
@@ -424,7 +495,8 @@ function renderRecentDetail(mine, idx, ctx, backOffset) {
   const edited = r.edited_at ? ' _\\(edited\\)_' : '';
   const noteText = String(r.note).slice(0, 3500);
   const truncated = r.note.length > 3500 ? '\n\n_\\[truncated\\]_' : '';
-  const text = `*${e(memberName)}*\n${date}${edited}\n\n${e(noteText)}${truncated}`;
+  const titleLine = renderNoteTitleLine(r.title);
+  const text = `*${e(memberName)}*\n${date}${edited}\n\n${titleLine}${e(noteText)}${truncated}`;
 
   const kb = new InlineKeyboard().text('⬅️ Back', `rec_list:${backOffset}`);
   const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
@@ -483,9 +555,23 @@ async function startEdit(ctx, updateId) {
   const row = await findUpdateRow(updateId);
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.reply(gate);
-  ctx.session.pending = { kind: 'edit_note', updateId };
+  const member = getMember(String(row.member_id));
+  const memberName = member ? memberLabel(member) : String(row.member_id);
+  const currentTitle = String(row.title ?? '').trim();
+  const currentBody = String(row.note ?? '');
+  const currentTitleDisplay = currentTitle ? `*${e(currentTitle)}*` : '_\\(none\\)_';
+  const bodyPreview = currentBody.slice(0, 200).replace(/\n/g, ' ') + (currentBody.length > 200 ? '…' : '');
+  ctx.session.pending = {
+    kind: 'edit_title',
+    updateId,
+    currentTitle,
+    currentBody,
+  };
   await ctx.reply(
-    `Sure thing ✏️ Editing ${mono(updateId)}\\.\nSend the updated note, or /cancel to leave it as\\-is\\.`,
+    `Editing your note for *${e(memberName)}* ✏️\n\n` +
+      `Current title: ${currentTitleDisplay}\n` +
+      `Current note: _${e(bodyPreview)}_\n\n` +
+      `Send a new title, /skip to keep it, or /cancel to back out\\.`,
     { parse_mode: 'MarkdownV2' },
   );
 }
@@ -540,13 +626,33 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply(`Use /1, /2 etc. to pick from the list, or /cancel to back out. 😊`);
   }
 
-  ctx.session.pending = null;
-  const note = ctx.message.text.trim();
-  if (!note) return ctx.reply(`Looks like that was empty — nothing saved. Try again? 😊`);
+  const raw = ctx.message.text.trim();
 
-  if (pending.kind === 'update_note') {
+  // Title step for new note: save title, move to body prompt.
+  if (pending.kind === 'update_title') {
     const member = getMember(pending.memberId);
-    if (!member) return ctx.reply(`Hmm, that member no longer exists in the list. Cancelled 😕`);
+    if (!member) {
+      ctx.session.pending = null;
+      return ctx.reply(`Hmm, that member no longer exists in the list. Cancelled 😕`);
+    }
+    const title = normalizeTitle(raw);
+    if (!title) return ctx.reply(`That title looks empty — try again, or /skip. 😊`);
+    ctx.session.pending = { kind: 'update_body', memberId: pending.memberId, title };
+    return ctx.reply(
+      `Nice\\. Now type the note for *${e(memberLabel(member))}*, or /cancel\\.`,
+      { parse_mode: 'MarkdownV2' },
+    );
+  }
+
+  // Body step for new note: save the record.
+  if (pending.kind === 'update_body') {
+    const member = getMember(pending.memberId);
+    if (!member) {
+      ctx.session.pending = null;
+      return ctx.reply(`Hmm, that member no longer exists in the list. Cancelled 😕`);
+    }
+    if (!raw) return ctx.reply(`Looks like that was empty — nothing saved. Try again, or /cancel. 😊`);
+    ctx.session.pending = null;
     await showTyping(ctx);
     const updateId = newUpdateId();
     await appendRow('_updates', {
@@ -555,26 +661,48 @@ bot.on('message:text', async (ctx) => {
       member_id: pending.memberId,
       author_tg_id: String(ctx.from.id),
       author_name: (await getLeaderName(ctx.from.id)) || ctx.from.first_name || '',
-      note,
+      title: pending.title || '',
+      note: raw,
       edited_at: '',
       deleted_at: '',
     });
     const kb = new InlineKeyboard()
       .text('✏️ Edit', `start_edit:${updateId}`)
       .text('🗑 Delete', `ask_delete:${updateId}`);
+    const titlePart = pending.title ? ` \\(*${e(pending.title)}*\\)` : '';
     return ctx.reply(
-      `Saved\\! 🙌 Your note for *${e(memberLabel(member))}* is in\\.`,
+      `Saved\\! 🙌 Your note for *${e(memberLabel(member))}*${titlePart} is in\\.`,
       { parse_mode: 'MarkdownV2', reply_markup: kb },
     );
   }
 
-  if (pending.kind === 'edit_note') {
+  // Title step for edit: capture new title, move to body prompt.
+  if (pending.kind === 'edit_title') {
+    const newTitle = normalizeTitle(raw);
+    if (!newTitle) return ctx.reply(`That title looks empty — try again, or /skip to keep the old one. 😊`);
+    ctx.session.pending = {
+      kind: 'edit_body',
+      updateId: pending.updateId,
+      newTitle,
+      currentBody: pending.currentBody,
+    };
+    return ctx.reply(
+      `Got the new title\\. Now send the updated note, /skip to keep the current one, or /cancel\\.`,
+      { parse_mode: 'MarkdownV2' },
+    );
+  }
+
+  // Body step for edit: save the updated row.
+  if (pending.kind === 'edit_body') {
+    if (!raw) return ctx.reply(`Looks like that was empty — try again, or /skip to keep the current note. 😊`);
+    ctx.session.pending = null;
     await showTyping(ctx);
     const row = await findUpdateRow(pending.updateId);
     const gate = checkEditGate(ctx, row);
     if (gate) return ctx.reply(gate);
     await updateRow('_updates', row._rowIndex, {
-      note,
+      title: pending.newTitle || '',
+      note: raw,
       edited_at: toSGTIso(),
     });
     ctx.session.recentList = null;
