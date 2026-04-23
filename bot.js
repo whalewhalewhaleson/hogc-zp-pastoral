@@ -12,12 +12,14 @@ import {
   memberLabel,
 } from './members.js';
 import { toSGTIso, formatSGTDate, hoursSince } from './util/time.js';
-import { e, bold, mono } from './util/escape.js';
+import { e, mono } from './util/escape.js';
 import { newUpdateId } from './util/id.js';
 
 const EDIT_WINDOW_HOURS = 24;
 const HISTORY_LIMIT = 20;
-const MINE_LIMIT = 20;
+const RECENT_LIMIT = 20;
+const RECENT_PAGE_SIZE = 5;
+const UPDATE_PAGE_SIZE = 20;
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -31,12 +33,15 @@ const bot = new Bot(process.env.BOT_TOKEN);
 
 bot.use(session({ initial: () => ({}) }));
 
-// Load caches on boot; retry on demand if Sheets is transient-down.
 await Promise.all([loadMembers(), reloadLeaders()]);
 
+// Fire-and-forget typing indicator before slow Sheets calls.
+async function showTyping(ctx) {
+  try { await ctx.replyWithChatAction('typing'); } catch {}
+}
+
 // ---------------------------------------------------------------------------
-// Auth guard — blocks every non-leader before any handler runs.
-// /start gets a special welcome flow instead of the generic block.
+// Auth guard
 // ---------------------------------------------------------------------------
 
 async function handleUnregisteredStart(ctx) {
@@ -83,20 +88,16 @@ bot.use(async (ctx, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// /start, /help
+// /start, /help, /cancel
 // ---------------------------------------------------------------------------
 
 const HELP_TEXT =
   `*ZP Pastoral Bot* 🌿\n` +
   `_Your companion for keeping pastoral notes on ZP1 members\\._\n\n` +
-  `/pastoralupdate — write a note about a member\n` +
-  `/members — see all active members\n` +
-  `/history \\[name\\] — recent updates \\(no name \\= recently updated members\\)\n` +
-  `/recent — your recent updates \\(with edit/delete buttons\\)\n` +
-  `/edit <update\\_id\\> — edit one of your updates \\(within ${EDIT_WINDOW_HOURS}h\\)\n` +
-  `/delete <update\\_id\\> — soft\\-delete \\(within ${EDIT_WINDOW_HOURS}h\\)\n` +
-  `/cancel — cancel whatever you were doing\n` +
-  `/reload — refresh member \\+ leader lists\n` +
+  `/update — write a note about a member\n` +
+  `/recent — your recent notes \\(tap to view, edit, or delete\\)\n` +
+  `/history \\[name\\] — browse a member's notes\n` +
+  `/cancel — back out of whatever you were doing\n` +
   `/help — show this message`;
 
 bot.command('start', async (ctx) => {
@@ -113,21 +114,19 @@ bot.command('cancel', (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// /reload
+// /reload, /members — still work, not surfaced in the help menu
 // ---------------------------------------------------------------------------
 
 bot.command('reload', async (ctx) => {
+  await showTyping(ctx);
   await Promise.all([reloadMembers(), reloadLeaders()]);
   await ctx.reply('All refreshed! ✨ Member and leader lists are up to date.');
 });
 
-// ---------------------------------------------------------------------------
-// /members — full active member list
-// ---------------------------------------------------------------------------
-
 bot.command('members', async (ctx) => {
   const all = getAllMembers();
   if (all.length === 0) return ctx.reply('No members loaded yet. Try /reload.');
+  await showTyping(ctx);
   const { rows } = await readRows('_updates');
   const countById = {};
   for (const r of rows) {
@@ -143,13 +142,31 @@ bot.command('members', async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// /pastoralupdate (/update alias) — write a new pastoral note
-// No args: show full numbered member list. With args: filtered list.
+// /update — write a new pastoral note
+// No args: paginated alphabetical list. With args: fuzzy search.
 // ---------------------------------------------------------------------------
 
-bot.command(['pastoralupdate', 'update'], async (ctx) => {
+function buildUpdatePickerPage(allSorted, page) {
+  const totalPages = Math.max(1, Math.ceil(allSorted.length / UPDATE_PAGE_SIZE));
+  const pageIdx = Math.max(0, Math.min(page, totalPages - 1));
+  const start = pageIdx * UPDATE_PAGE_SIZE;
+  const slice = allSorted.slice(start, start + UPDATE_PAGE_SIZE);
+  const rangeFrom = start + 1;
+  const rangeTo = start + slice.length;
+
+  let text = `Who are you writing about? 📋 \\(${rangeFrom}–${rangeTo} of ${allSorted.length}\\)\n\n`;
+  slice.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
+  text += `\nReply /1–/${slice.length} to pick, /cancel to back out, or /update <name\\> to search by name\\.`;
+
+  const kb = new InlineKeyboard();
+  if (pageIdx > 0) kb.text('⬅️ Back', `update_page:${pageIdx - 1}`);
+  if (pageIdx < totalPages - 1) kb.text('➡️ Next', `update_page:${pageIdx + 1}`);
+
+  return { text, keyboard: kb, pageIdx, slice };
+}
+
+bot.command('update', async (ctx) => {
   const query = ctx.match?.trim();
-  let candidates;
 
   if (!query) {
     const all = getAllMembers();
@@ -159,16 +176,16 @@ bot.command(['pastoralupdate', 'update'], async (ctx) => {
           `Make sure the Apps Script has been run to generate Member IDs in the spreadsheet, then try /reload.`,
       );
     }
-    candidates = all.slice(0, 20);
-    const overflow = all.length - candidates.length;
-    let text = `Who are you writing about? 📋\n\n`;
-    candidates.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
-    if (overflow > 0) {
-      text += `\n_…and ${overflow} more — try /pastoralupdate <name\\> to filter_`;
-    }
-    text += `\n\nReply with /1, /2 etc\\.`;
-    ctx.session.pending = { kind: 'pick_member', candidates, intent: 'update_note' };
-    return ctx.reply(text, { parse_mode: 'MarkdownV2' });
+    const allSorted = [...all].sort((a, b) => a.name.localeCompare(b.name));
+    const { text, keyboard, slice, pageIdx } = buildUpdatePickerPage(allSorted, 0);
+    ctx.session.pending = {
+      kind: 'pick_member',
+      candidates: slice,
+      intent: 'update_note',
+      allSorted,
+      page: pageIdx,
+    };
+    return ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
   }
 
   const matches = searchMembers(query, 8);
@@ -179,20 +196,36 @@ bot.command(['pastoralupdate', 'update'], async (ctx) => {
     const m = matches[0];
     ctx.session.pending = { kind: 'update_note', memberId: m.memberId };
     return ctx.reply(
-      `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your update\\.`,
+      `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your note, or /cancel if you change your mind\\.`,
       { parse_mode: 'MarkdownV2' },
     );
   }
-  candidates = matches;
   let text = `Found a few — which one? 🙂\n\n`;
-  candidates.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
-  text += `\nReply with /1, /2 etc\\.`;
-  ctx.session.pending = { kind: 'pick_member', candidates, intent: 'update_note' };
+  matches.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
+  text += `\nReply /1–/${matches.length}, or /cancel\\.`;
+  ctx.session.pending = { kind: 'pick_member', candidates: matches, intent: 'update_note' };
   return ctx.reply(text, { parse_mode: 'MarkdownV2' });
 });
 
+bot.callbackQuery(/^update_page:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'pick_member' || !pending.allSorted) {
+    return ctx.reply('This list has expired — run /update to start over. 😊');
+  }
+  const page = parseInt(ctx.match[1], 10);
+  const { text, keyboard, slice, pageIdx } = buildUpdatePickerPage(pending.allSorted, page);
+  pending.candidates = slice;
+  pending.page = pageIdx;
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  } catch {
+    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  }
+});
+
 // ---------------------------------------------------------------------------
-// /1, /2, /3 … — pick from a numbered member list
+// /1, /2, /3 … — pick from a numbered list (member or update)
 // ---------------------------------------------------------------------------
 
 bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
@@ -206,29 +239,15 @@ bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
   if (pending.kind === 'pick_update') {
     const idx = num - 1;
     if (idx < 0 || idx >= pending.updates.length) {
-      return ctx.reply(`I only have ${pending.updates.length} update${pending.updates.length === 1 ? '' : 's'} listed. Reply with /1 to /${pending.updates.length}. 😊`);
+      return ctx.reply(`I only have ${pending.updates.length} update${pending.updates.length === 1 ? '' : 's'} listed. Reply /1–/${pending.updates.length}, or /cancel. 😊`);
     }
     ctx.session.pending = null;
-    const r = pending.updates[idx];
-    const member = getMember(String(r.member_id));
-    const memberName = member ? memberLabel(member) : String(r.member_id);
-    const date = e(formatSGTDate(r.timestamp));
-    const author = e(r.author_name || String(r.author_tg_id));
-    const edited = r.edited_at ? ' _\\(edited\\)_' : '';
-    const text = `*${e(memberName)}*\n${date} · ${author}${edited}\n\n${e(r.note)}`;
-    const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
-    const opts = { parse_mode: 'MarkdownV2' };
-    if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
-      opts.reply_markup = new InlineKeyboard()
-        .text('✏️ Edit', `start_edit:${r.update_id}`)
-        .text('🗑 Delete', `ask_delete:${r.update_id}`);
-    }
-    return ctx.reply(text, opts);
+    return showUpdateDetail(ctx, pending.updates[idx]);
   }
 
   const idx = num - 1;
   if (idx < 0 || idx >= pending.candidates.length) {
-    return ctx.reply(`I only have ${pending.candidates.length} option${pending.candidates.length === 1 ? '' : 's'} listed. Reply with /1 to /${pending.candidates.length}. 😊`);
+    return ctx.reply(`I only have ${pending.candidates.length} option${pending.candidates.length === 1 ? '' : 's'} on this page. Reply /1–/${pending.candidates.length}, or /cancel. 😊`);
   }
 
   const m = pending.candidates[idx];
@@ -240,19 +259,37 @@ bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
 
   ctx.session.pending = { kind: 'update_note', memberId: m.memberId };
   await ctx.reply(
-    `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your update\\.`,
+    `Got it — writing a note for *${e(memberLabel(m))}* 📝\nGo ahead and type your note, or /cancel if you change your mind\\.`,
     { parse_mode: 'MarkdownV2' },
   );
 });
 
+async function showUpdateDetail(ctx, r) {
+  const member = getMember(String(r.member_id));
+  const memberName = member ? memberLabel(member) : String(r.member_id);
+  const date = e(formatSGTDate(r.timestamp));
+  const author = e(r.author_name || String(r.author_tg_id));
+  const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+  const text = `*${e(memberName)}*\n${date} · ${author}${edited}\n\n${e(r.note)}`;
+  const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
+  const opts = { parse_mode: 'MarkdownV2' };
+  if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
+    opts.reply_markup = new InlineKeyboard()
+      .text('✏️ Edit', `start_edit:${r.update_id}`)
+      .text('🗑 Delete', `ask_delete:${r.update_id}`);
+  }
+  return ctx.reply(text, opts);
+}
+
 // ---------------------------------------------------------------------------
-// /history — list updates for one member
+// /history — browse updates for one member
 // ---------------------------------------------------------------------------
 
 bot.command('history', async (ctx) => {
   const query = ctx.match?.trim();
 
   if (!query) {
+    await showTyping(ctx);
     const { rows } = await readRows('_updates');
     const latestByMember = new Map();
     for (const r of rows) {
@@ -270,11 +307,11 @@ bot.command('history', async (ctx) => {
       .filter(Boolean);
 
     if (recent.length === 0) {
-      return ctx.reply('No updates written yet\\. Use /pastoralupdate to write the first one\\! 🌱', { parse_mode: 'MarkdownV2' });
+      return ctx.reply('No notes written yet\\. Use /update to write the first one\\! 🌱', { parse_mode: 'MarkdownV2' });
     }
     let text = `Recently updated — whose history? 📖\n\n`;
     recent.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
-    text += `\nOr type /history <name\\> to search\\.`;
+    text += `\nPick /1–/${recent.length}, /cancel, or type /history <name\\> to search\\.`;
     ctx.session.pending = { kind: 'pick_member', candidates: recent, intent: 'history' };
     return ctx.reply(text, { parse_mode: 'MarkdownV2' });
   }
@@ -303,6 +340,7 @@ bot.callbackQuery(/^pick_history:(.+)$/, async (ctx) => {
 async function sendHistory(ctx, memberId) {
   const member = getMember(memberId);
   if (!member) return ctx.reply('Member not found. Try /reload.');
+  await showTyping(ctx);
   const { rows } = await readRows('_updates');
   const filtered = rows
     .filter((r) => String(r.member_id) === memberId && !r.deleted_at)
@@ -310,10 +348,10 @@ async function sendHistory(ctx, memberId) {
     .slice(0, HISTORY_LIMIT);
 
   if (filtered.length === 0) {
-    return ctx.reply(`No updates written for ${memberLabel(member)} yet. They're waiting for someone to care! 💛`);
+    return ctx.reply(`No notes written for ${memberLabel(member)} yet. They're waiting for someone to care! 💛`);
   }
 
-  let text = `*${e(memberLabel(member))}* — ${filtered.length} update${filtered.length === 1 ? '' : 's'} 📖\n\n`;
+  let text = `*${e(memberLabel(member))}* — ${filtered.length} note${filtered.length === 1 ? '' : 's'} 📖\n\n`;
   filtered.forEach((r, i) => {
     const date = e(formatSGTDate(r.timestamp));
     const author = e(r.author_name || String(r.author_tg_id));
@@ -321,50 +359,107 @@ async function sendHistory(ctx, memberId) {
     const preview = e(String(r.note).slice(0, 40).replace(/\n/g, ' ') + (r.note.length > 40 ? '…' : ''));
     text += `/${i + 1} ${date} · ${author}${edited}\n_${preview}_\n\n`;
   });
-  text += `Reply with /1 to /${filtered.length} to read in full\\.`;
+  text += `Reply /1–/${filtered.length} to read, or /cancel\\.`;
   ctx.session.pending = { kind: 'pick_update', updates: filtered };
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
 }
 
 // ---------------------------------------------------------------------------
-// /recent — your recent updates with inline edit/delete
+// /recent — your recent notes as individual messages with inline buttons
 // ---------------------------------------------------------------------------
 
-bot.command(['recent', 'mine'], async (ctx) => {
+bot.command('recent', async (ctx) => {
+  ctx.session.pending = null;
   const authorTgId = String(ctx.from.id);
+  await showTyping(ctx);
   const { rows } = await readRows('_updates');
   const mine = rows
     .filter((r) => String(r.author_tg_id) === authorTgId && !r.deleted_at)
     .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
-    .slice(0, MINE_LIMIT);
+    .slice(0, RECENT_LIMIT);
 
   if (mine.length === 0) {
-    return ctx.reply(`You haven't written any updates yet — go love on someone! 💛`);
+    return ctx.reply(`You haven't written any notes yet — go love on someone! 💛`);
   }
 
-  let text = `Here are your recent updates\\! 📋\n\n`;
-  mine.forEach((r, i) => {
-    const member = getMember(String(r.member_id));
-    const memberName = e(member ? memberLabel(member) : String(r.member_id));
-    const date = e(formatSGTDate(r.timestamp));
-    const edited = r.edited_at ? ' _\\(edited\\)_' : '';
-    const preview = e(String(r.note).slice(0, 40).replace(/\n/g, ' ') + (r.note.length > 40 ? '…' : ''));
-    text += `/${i + 1} *${memberName}* · ${date}${edited}\n_${preview}_\n\n`;
-  });
-  text += `Reply with /1 to /${mine.length} to view, edit, or delete\\.`;
-  ctx.session.pending = { kind: 'pick_update', updates: mine };
-  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+  await ctx.reply(`Here are your recent notes! 📋 (${mine.length} total)`);
+  await sendRecentPage(ctx, mine, 0);
+});
+
+async function sendRecentPage(ctx, mine, offset) {
+  const page = mine.slice(offset, offset + RECENT_PAGE_SIZE);
+  for (const r of page) {
+    await sendRecentEntry(ctx, r);
+  }
+  const nextOffset = offset + RECENT_PAGE_SIZE;
+  if (nextOffset < mine.length) {
+    const remaining = mine.length - nextOffset;
+    const batch = Math.min(RECENT_PAGE_SIZE, remaining);
+    ctx.session.recentList = mine;
+    const kb = new InlineKeyboard().text(`⬇️ Show ${batch} more`, `recent_more:${nextOffset}`);
+    await ctx.reply(`Showing ${page.length} of ${mine.length} — ${remaining} more below.`, { reply_markup: kb });
+  } else {
+    ctx.session.recentList = null;
+  }
+}
+
+async function sendRecentEntry(ctx, r) {
+  const member = getMember(String(r.member_id));
+  const memberName = e(member ? memberLabel(member) : String(r.member_id));
+  const date = e(formatSGTDate(r.timestamp));
+  const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+  const preview = e(String(r.note).slice(0, 100).replace(/\n/g, ' ') + (r.note.length > 100 ? '…' : ''));
+  const text = `📝 *${memberName}* · ${date}${edited}\n_${preview}_`;
+
+  const kb = new InlineKeyboard().text('👁 View full', `view_update:${r.update_id}`);
+  const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
+  if (withinWindow) {
+    kb.text('✏️ Edit', `start_edit:${r.update_id}`).text('🗑 Delete', `ask_delete:${r.update_id}`);
+  }
+
+  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+}
+
+bot.callbackQuery(/^view_update:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const updateId = ctx.match[1];
+  await showTyping(ctx);
+  const row = await findUpdateRow(updateId);
+  if (!row || row.deleted_at) {
+    return ctx.reply(`Hmm, I couldn't find that note — it may have been deleted.`);
+  }
+  const member = getMember(String(row.member_id));
+  const memberName = member ? memberLabel(member) : String(row.member_id);
+  const date = e(formatSGTDate(row.timestamp));
+  const edited = row.edited_at ? ' _\\(edited\\)_' : '';
+  const text = `*${e(memberName)}*\n${date}${edited}\n\n${e(row.note)}`;
+
+  const kb = new InlineKeyboard();
+  const withinWindow = hoursSince(row.timestamp) < EDIT_WINDOW_HOURS;
+  if (withinWindow && String(row.author_tg_id) === String(ctx.from.id)) {
+    kb.text('✏️ Edit', `start_edit:${row.update_id}`).text('🗑 Delete', `ask_delete:${row.update_id}`);
+  }
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+  } catch {
+    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+  }
+});
+
+bot.callbackQuery(/^recent_more:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const offset = parseInt(ctx.match[1], 10);
+  const mine = ctx.session.recentList;
+  if (!mine) {
+    return ctx.reply(`This list has expired — run /recent to see your notes again. 😊`);
+  }
+  try { await ctx.deleteMessage(); } catch {}
+  await sendRecentPage(ctx, mine, offset);
 });
 
 // ---------------------------------------------------------------------------
-// /edit, /delete — by update_id
+// Edit / Delete — via inline buttons only
 // ---------------------------------------------------------------------------
-
-bot.command('edit', async (ctx) => {
-  const id = ctx.match?.trim();
-  if (!id) return ctx.reply('Usage: /edit <update_id>');
-  return startEdit(ctx, id);
-});
 
 bot.callbackQuery(/^start_edit:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -372,21 +467,16 @@ bot.callbackQuery(/^start_edit:(.+)$/, async (ctx) => {
 });
 
 async function startEdit(ctx, updateId) {
+  await showTyping(ctx);
   const row = await findUpdateRow(updateId);
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.reply(gate);
   ctx.session.pending = { kind: 'edit_note', updateId };
   await ctx.reply(
-    `Sure thing ✏️ Editing ${mono(updateId)}\\.\nGo ahead and send the updated note\\.`,
+    `Sure thing ✏️ Editing ${mono(updateId)}\\.\nSend the updated note, or /cancel to leave it as\\-is\\.`,
     { parse_mode: 'MarkdownV2' },
   );
 }
-
-bot.command('delete', async (ctx) => {
-  const id = ctx.match?.trim();
-  if (!id) return ctx.reply('Usage: /delete <update_id>');
-  return askDelete(ctx, id);
-});
 
 bot.callbackQuery(/^ask_delete:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -394,6 +484,7 @@ bot.callbackQuery(/^ask_delete:(.+)$/, async (ctx) => {
 });
 
 async function askDelete(ctx, updateId) {
+  await showTyping(ctx);
   const row = await findUpdateRow(updateId);
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.reply(gate);
@@ -414,6 +505,7 @@ bot.callbackQuery(/^cancel_delete:(.+)$/, async (ctx) => {
 bot.callbackQuery(/^confirm_delete:(.+)$/, async (ctx) => {
   const updateId = ctx.match[1];
   await ctx.answerCallbackQuery();
+  await showTyping(ctx);
   const row = await findUpdateRow(updateId);
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.editMessageText(gate);
@@ -431,8 +523,8 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply(`Hmm, I'm not sure what to do with that 😅 Type /help to see what I can do.`);
   }
 
-  if (pending.kind === 'pick_member') {
-    return ctx.reply(`Use /1, /2 etc. to pick someone from the list, or /pastoralupdate to start over. 😊`);
+  if (pending.kind === 'pick_member' || pending.kind === 'pick_update') {
+    return ctx.reply(`Use /1, /2 etc. to pick from the list, or /cancel to back out. 😊`);
   }
 
   ctx.session.pending = null;
@@ -442,6 +534,7 @@ bot.on('message:text', async (ctx) => {
   if (pending.kind === 'update_note') {
     const member = getMember(pending.memberId);
     if (!member) return ctx.reply(`Hmm, that member no longer exists in the list. Cancelled 😕`);
+    await showTyping(ctx);
     const updateId = newUpdateId();
     await appendRow('_updates', {
       update_id: updateId,
@@ -457,12 +550,13 @@ bot.on('message:text', async (ctx) => {
       .text('✏️ Edit', `start_edit:${updateId}`)
       .text('🗑 Delete', `ask_delete:${updateId}`);
     return ctx.reply(
-      `Saved\\! 🙌 Your note for *${e(memberLabel(member))}* is in\\.\nUpdate ID: ${mono(updateId)}`,
+      `Saved\\! 🙌 Your note for *${e(memberLabel(member))}* is in\\.`,
       { parse_mode: 'MarkdownV2', reply_markup: kb },
     );
   }
 
   if (pending.kind === 'edit_note') {
+    await showTyping(ctx);
     const row = await findUpdateRow(pending.updateId);
     const gate = checkEditGate(ctx, row);
     if (gate) return ctx.reply(gate);
@@ -484,13 +578,13 @@ async function findUpdateRow(updateId) {
 }
 
 function checkEditGate(ctx, row) {
-  if (!row) return `I couldn't find that update — it may have already been removed.`;
-  if (row.deleted_at) return `That update has already been deleted. 🗑`;
+  if (!row) return `I couldn't find that note — it may have already been removed.`;
+  if (row.deleted_at) return `That note has already been deleted. 🗑`;
   if (String(row.author_tg_id) !== String(ctx.from.id)) {
-    return `You can only edit or delete updates you wrote yourself. 😊`;
+    return `You can only edit or delete notes you wrote yourself. 😊`;
   }
   if (hoursSince(row.timestamp) >= EDIT_WINDOW_HOURS) {
-    return `The ${EDIT_WINDOW_HOURS}h edit window has passed. Just write a new update instead! 😊`;
+    return `The ${EDIT_WINDOW_HOURS}h edit window has passed. Just write a new note instead! 😊`;
   }
   return null;
 }
