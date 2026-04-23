@@ -365,7 +365,8 @@ async function sendHistory(ctx, memberId) {
 }
 
 // ---------------------------------------------------------------------------
-// /recent — your recent notes as individual messages with inline buttons
+// /recent — your recent notes in a single message that morphs between
+// list view and detail view. One message, in-place edits, no chat spam.
 // ---------------------------------------------------------------------------
 
 bot.command('recent', async (ctx) => {
@@ -382,79 +383,90 @@ bot.command('recent', async (ctx) => {
     return ctx.reply(`You haven't written any notes yet — go love on someone! 💛`);
   }
 
-  await ctx.reply(`Here are your recent notes! 📋 (${mine.length} total)`);
-  await sendRecentPage(ctx, mine, 0);
+  ctx.session.recentList = mine;
+  const { text, keyboard } = renderRecentList(mine, 0);
+  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
 });
 
-async function sendRecentPage(ctx, mine, offset) {
+function renderRecentList(mine, offset) {
   const page = mine.slice(offset, offset + RECENT_PAGE_SIZE);
-  for (const r of page) {
-    await sendRecentEntry(ctx, r);
+  const rangeFrom = offset + 1;
+  const rangeTo = offset + page.length;
+
+  let text = `*Your recent notes* \\(${rangeFrom}–${rangeTo} of ${mine.length}\\)\n\n`;
+  page.forEach((r, i) => {
+    const member = getMember(String(r.member_id));
+    const memberName = e(member ? memberLabel(member) : String(r.member_id));
+    const date = e(formatSGTDate(r.timestamp));
+    const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+    const preview = e(String(r.note).slice(0, 80).replace(/\n/g, ' ') + (r.note.length > 80 ? '…' : ''));
+    text += `*${i + 1}\\.* 📝 *${memberName}* · ${date}${edited}\n_${preview}_\n\n`;
+  });
+  text += `Tap a number to open\\.`;
+
+  const kb = new InlineKeyboard();
+  page.forEach((_, i) => { kb.text(String(i + 1), `rec_open:${offset + i}`); });
+  kb.row();
+  if (offset > 0) kb.text('⬅️ Prev', `rec_list:${Math.max(0, offset - RECENT_PAGE_SIZE)}`);
+  if (offset + RECENT_PAGE_SIZE < mine.length) {
+    kb.text('⬇️ Next', `rec_list:${offset + RECENT_PAGE_SIZE}`);
   }
-  const nextOffset = offset + RECENT_PAGE_SIZE;
-  if (nextOffset < mine.length) {
-    const remaining = mine.length - nextOffset;
-    const batch = Math.min(RECENT_PAGE_SIZE, remaining);
-    ctx.session.recentList = mine;
-    const kb = new InlineKeyboard().text(`⬇️ Show ${batch} more`, `recent_more:${nextOffset}`);
-    await ctx.reply(`Showing ${page.length} of ${mine.length} — ${remaining} more below.`, { reply_markup: kb });
-  } else {
-    ctx.session.recentList = null;
-  }
+
+  return { text, keyboard: kb };
 }
 
-async function sendRecentEntry(ctx, r) {
+function renderRecentDetail(mine, idx, ctx, backOffset) {
+  const r = mine[idx];
+  if (!r) return null;
   const member = getMember(String(r.member_id));
-  const memberName = e(member ? memberLabel(member) : String(r.member_id));
+  const memberName = member ? memberLabel(member) : String(r.member_id);
   const date = e(formatSGTDate(r.timestamp));
   const edited = r.edited_at ? ' _\\(edited\\)_' : '';
-  const preview = e(String(r.note).slice(0, 100).replace(/\n/g, ' ') + (r.note.length > 100 ? '…' : ''));
-  const text = `📝 *${memberName}* · ${date}${edited}\n_${preview}_`;
+  const noteText = String(r.note).slice(0, 3500);
+  const truncated = r.note.length > 3500 ? '\n\n_\\[truncated\\]_' : '';
+  const text = `*${e(memberName)}*\n${date}${edited}\n\n${e(noteText)}${truncated}`;
 
-  const kb = new InlineKeyboard().text('👁 View full', `view_update:${r.update_id}`);
+  const kb = new InlineKeyboard().text('⬅️ Back', `rec_list:${backOffset}`);
   const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
-  if (withinWindow) {
+  if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
     kb.text('✏️ Edit', `start_edit:${r.update_id}`).text('🗑 Delete', `ask_delete:${r.update_id}`);
   }
 
-  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+  return { text, keyboard: kb };
 }
 
-bot.callbackQuery(/^view_update:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const updateId = ctx.match[1];
-  await showTyping(ctx);
-  const row = await findUpdateRow(updateId);
-  if (!row || row.deleted_at) {
-    return ctx.reply(`Hmm, I couldn't find that note — it may have been deleted.`);
-  }
-  const member = getMember(String(row.member_id));
-  const memberName = member ? memberLabel(member) : String(row.member_id);
-  const date = e(formatSGTDate(row.timestamp));
-  const edited = row.edited_at ? ' _\\(edited\\)_' : '';
-  const text = `*${e(memberName)}*\n${date}${edited}\n\n${e(row.note)}`;
-
-  const kb = new InlineKeyboard();
-  const withinWindow = hoursSince(row.timestamp) < EDIT_WINDOW_HOURS;
-  if (withinWindow && String(row.author_tg_id) === String(ctx.from.id)) {
-    kb.text('✏️ Edit', `start_edit:${row.update_id}`).text('🗑 Delete', `ask_delete:${row.update_id}`);
-  }
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
-  } catch {
-    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
-  }
-});
-
-bot.callbackQuery(/^recent_more:(\d+)$/, async (ctx) => {
+bot.callbackQuery(/^rec_list:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const offset = parseInt(ctx.match[1], 10);
   const mine = ctx.session.recentList;
   if (!mine) {
-    return ctx.reply(`This list has expired — run /recent to see your notes again. 😊`);
+    return ctx.editMessageText(`This list has expired — tap /recent to reload. 😊`);
   }
-  try { await ctx.deleteMessage(); } catch {}
-  await sendRecentPage(ctx, mine, offset);
+  const { text, keyboard } = renderRecentList(mine, offset);
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  } catch {
+    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  }
+});
+
+bot.callbackQuery(/^rec_open:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const absIdx = parseInt(ctx.match[1], 10);
+  const mine = ctx.session.recentList;
+  if (!mine) {
+    return ctx.editMessageText(`This list has expired — tap /recent to reload. 😊`);
+  }
+  const backOffset = Math.floor(absIdx / RECENT_PAGE_SIZE) * RECENT_PAGE_SIZE;
+  const detail = renderRecentDetail(mine, absIdx, ctx, backOffset);
+  if (!detail) {
+    return ctx.editMessageText(`Hmm, I couldn't find that note — tap /recent to reload.`);
+  }
+  try {
+    await ctx.editMessageText(detail.text, { parse_mode: 'MarkdownV2', reply_markup: detail.keyboard });
+  } catch {
+    await ctx.reply(detail.text, { parse_mode: 'MarkdownV2', reply_markup: detail.keyboard });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -510,6 +522,7 @@ bot.callbackQuery(/^confirm_delete:(.+)$/, async (ctx) => {
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.editMessageText(gate);
   await updateRow('_updates', row._rowIndex, { deleted_at: toSGTIso() });
+  ctx.session.recentList = null;
   await ctx.editMessageText(`Done — that note has been removed. 🗑\nWilson can recover it from the sheet if needed.`);
 });
 
@@ -564,6 +577,7 @@ bot.on('message:text', async (ctx) => {
       note,
       edited_at: toSGTIso(),
     });
+    ctx.session.recentList = null;
     return ctx.reply(`Done\\! Your note has been updated\\. ✏️`, { parse_mode: 'MarkdownV2' });
   }
 });
