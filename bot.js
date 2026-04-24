@@ -1,7 +1,11 @@
 import 'dotenv/config';
 import { Bot, InlineKeyboard, session } from 'grammy';
 
-import { appendRow, readRows, updateRow } from './sheets.js';
+import {
+  insertUpdate, getUpdate, patchUpdate, softDeleteUpdate,
+  getUpdatesByMember, getRecentUpdatesByAuthor,
+  countUpdatesByMember, getLatestUpdatePerMember,
+} from './shared/supabase.js';
 import { isLeader, getLeaderName, reloadLeaders } from './leaders.js';
 import {
   loadMembers,
@@ -169,7 +173,7 @@ bot.command('skip', async (ctx) => {
       ctx.session.pending = null;
       return ctx.reply(gate);
     }
-    await updateRow('_updates', row._rowIndex, {
+    await patchUpdate(row.id, {
       title: pending.newTitle,
       edited_at: toSGTIso(),
     });
@@ -195,11 +199,7 @@ bot.command('members', async (ctx) => {
   const all = getAllMembers();
   if (all.length === 0) return ctx.reply('No members loaded yet. Try /reload.');
   await showTyping(ctx);
-  const { rows } = await readRows('_updates');
-  const countById = {};
-  for (const r of rows) {
-    if (!r.deleted_at) countById[String(r.member_id)] = (countById[String(r.member_id)] ?? 0) + 1;
-  }
+  const countById = await countUpdatesByMember();
   const lines = all
     .map((m) => {
       const count = countById[m.memberId] ?? 0;
@@ -335,17 +335,17 @@ bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
 async function showUpdateDetail(ctx, r) {
   const member = getMember(String(r.member_id));
   const memberName = member ? memberLabel(member) : String(r.member_id);
-  const date = e(formatSGTDate(r.timestamp));
+  const date = e(formatSGTDate(r.created_at));
   const author = e(r.author_name || String(r.author_tg_id));
   const edited = r.edited_at ? ' _\\(edited\\)_' : '';
   const titleLine = renderNoteTitleLine(r.title);
   const text = `*${e(memberName)}*\n${date} · ${author}${edited}\n\n${titleLine}${e(r.note)}`;
-  const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
+  const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
   const opts = { parse_mode: 'MarkdownV2' };
   if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
     opts.reply_markup = new InlineKeyboard()
-      .text('✏️ Edit', `start_edit:${r.update_id}`)
-      .text('🗑 Delete', `ask_delete:${r.update_id}`);
+      .text('✏️ Edit', `start_edit:${r.id}`)
+      .text('🗑 Delete', `ask_delete:${r.id}`);
   }
   return ctx.reply(text, opts);
 }
@@ -359,21 +359,8 @@ bot.command('history', async (ctx) => {
 
   if (!query) {
     await showTyping(ctx);
-    const { rows } = await readRows('_updates');
-    const latestByMember = new Map();
-    for (const r of rows) {
-      if (r.deleted_at) continue;
-      const id = String(r.member_id);
-      const ts = String(r.timestamp);
-      if (!latestByMember.has(id) || ts > latestByMember.get(id)) {
-        latestByMember.set(id, ts);
-      }
-    }
-    const recent = [...latestByMember.entries()]
-      .sort((a, b) => b[1].localeCompare(a[1]))
-      .slice(0, 10)
-      .map(([id]) => getMember(id))
-      .filter(Boolean);
+    const recentMemberIds = await getLatestUpdatePerMember(10);
+    const recent = recentMemberIds.map((id) => getMember(id)).filter(Boolean);
 
     if (recent.length === 0) {
       return ctx.reply('No notes written yet\\. Use /update to write the first one\\! 🌱', { parse_mode: 'MarkdownV2' });
@@ -410,11 +397,7 @@ async function sendHistory(ctx, memberId) {
   const member = getMember(memberId);
   if (!member) return ctx.reply('Member not found. Try /reload.');
   await showTyping(ctx);
-  const { rows } = await readRows('_updates');
-  const filtered = rows
-    .filter((r) => String(r.member_id) === memberId && !r.deleted_at)
-    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
-    .slice(0, HISTORY_LIMIT);
+  const filtered = await getUpdatesByMember(memberId, HISTORY_LIMIT);
 
   if (filtered.length === 0) {
     return ctx.reply(`No notes written for ${memberLabel(member)} yet. They're waiting for someone to care! 💛`);
@@ -422,7 +405,7 @@ async function sendHistory(ctx, memberId) {
 
   let text = `*${e(memberLabel(member))}* — ${filtered.length} note${filtered.length === 1 ? '' : 's'} 📖\n\n`;
   filtered.forEach((r, i) => {
-    const date = e(formatSGTDate(r.timestamp));
+    const date = e(formatSGTDate(r.created_at));
     const author = e(r.author_name || String(r.author_tg_id));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
     const titleLine = r.title ? `*${e(r.title)}*\n` : '';
@@ -441,13 +424,9 @@ async function sendHistory(ctx, memberId) {
 
 bot.command('recent', async (ctx) => {
   ctx.session.pending = null;
-  const authorTgId = String(ctx.from.id);
+  const authorTgId = ctx.from.id;
   await showTyping(ctx);
-  const { rows } = await readRows('_updates');
-  const mine = rows
-    .filter((r) => String(r.author_tg_id) === authorTgId && !r.deleted_at)
-    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
-    .slice(0, RECENT_LIMIT);
+  const mine = await getRecentUpdatesByAuthor(authorTgId, RECENT_LIMIT);
 
   if (mine.length === 0) {
     return ctx.reply(`You haven't written any notes yet — go love on someone! 💛`);
@@ -467,7 +446,7 @@ function renderRecentList(mine, offset) {
   page.forEach((r, i) => {
     const member = getMember(String(r.member_id));
     const memberName = e(member ? memberLabel(member) : String(r.member_id));
-    const date = e(formatSGTDate(r.timestamp));
+    const date = e(formatSGTDate(r.created_at));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
     const titleLine = r.title ? `*${e(r.title)}*\n` : '';
     const preview = e(String(r.note).slice(0, 80).replace(/\n/g, ' ') + (r.note.length > 80 ? '…' : ''));
@@ -491,7 +470,7 @@ function renderRecentDetail(mine, idx, ctx, backOffset) {
   if (!r) return null;
   const member = getMember(String(r.member_id));
   const memberName = member ? memberLabel(member) : String(r.member_id);
-  const date = e(formatSGTDate(r.timestamp));
+  const date = e(formatSGTDate(r.created_at));
   const edited = r.edited_at ? ' _\\(edited\\)_' : '';
   const noteText = String(r.note).slice(0, 3500);
   const truncated = r.note.length > 3500 ? '\n\n_\\[truncated\\]_' : '';
@@ -499,9 +478,9 @@ function renderRecentDetail(mine, idx, ctx, backOffset) {
   const text = `*${e(memberName)}*\n${date}${edited}\n\n${titleLine}${e(noteText)}${truncated}`;
 
   const kb = new InlineKeyboard().text('⬅️ Back', `rec_list:${backOffset}`);
-  const withinWindow = hoursSince(r.timestamp) < EDIT_WINDOW_HOURS;
+  const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
   if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
-    kb.text('✏️ Edit', `start_edit:${r.update_id}`).text('🗑 Delete', `ask_delete:${r.update_id}`);
+    kb.text('✏️ Edit', `start_edit:${r.id}`).text('🗑 Delete', `ask_delete:${r.id}`);
   }
 
   return { text, keyboard: kb };
@@ -607,7 +586,7 @@ bot.callbackQuery(/^confirm_delete:(.+)$/, async (ctx) => {
   const row = await findUpdateRow(updateId);
   const gate = checkEditGate(ctx, row);
   if (gate) return ctx.editMessageText(gate);
-  await updateRow('_updates', row._rowIndex, { deleted_at: toSGTIso() });
+  await softDeleteUpdate(row.id, toSGTIso());
   ctx.session.recentList = null;
   await ctx.editMessageText(`Done — that note has been removed. 🗑\nWilson can recover it from the sheet if needed.`);
 });
@@ -655,16 +634,13 @@ bot.on('message:text', async (ctx) => {
     ctx.session.pending = null;
     await showTyping(ctx);
     const updateId = newUpdateId();
-    await appendRow('_updates', {
-      update_id: updateId,
-      timestamp: toSGTIso(),
+    await insertUpdate({
+      id: updateId,
       member_id: pending.memberId,
-      author_tg_id: String(ctx.from.id),
+      author_tg_id: ctx.from.id,
       author_name: (await getLeaderName(ctx.from.id)) || ctx.from.first_name || '',
-      title: pending.title || '',
+      title: pending.title || null,
       note: raw,
-      edited_at: '',
-      deleted_at: '',
     });
     const kb = new InlineKeyboard()
       .text('✏️ Edit', `start_edit:${updateId}`)
@@ -700,8 +676,8 @@ bot.on('message:text', async (ctx) => {
     const row = await findUpdateRow(pending.updateId);
     const gate = checkEditGate(ctx, row);
     if (gate) return ctx.reply(gate);
-    await updateRow('_updates', row._rowIndex, {
-      title: pending.newTitle || '',
+    await patchUpdate(row.id, {
+      title: pending.newTitle || null,
       note: raw,
       edited_at: toSGTIso(),
     });
@@ -715,8 +691,7 @@ bot.on('message:text', async (ctx) => {
 // ---------------------------------------------------------------------------
 
 async function findUpdateRow(updateId) {
-  const { rows } = await readRows('_updates');
-  return rows.find((r) => String(r.update_id) === updateId) ?? null;
+  return getUpdate(updateId);
 }
 
 function checkEditGate(ctx, row) {
@@ -725,7 +700,7 @@ function checkEditGate(ctx, row) {
   if (String(row.author_tg_id) !== String(ctx.from.id)) {
     return `You can only edit or delete notes you wrote yourself. 😊`;
   }
-  if (hoursSince(row.timestamp) >= EDIT_WINDOW_HOURS) {
+  if (hoursSince(row.created_at) >= EDIT_WINDOW_HOURS) {
     return `The ${EDIT_WINDOW_HOURS}h edit window has passed. Just write a new note instead! 😊`;
   }
   return null;

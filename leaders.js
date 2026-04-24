@@ -1,21 +1,12 @@
-import { readRows } from './sheets.js';
+import { fetchActiveLeaders } from './shared/supabase.js';
 
 let _cache = { byId: new Map(), loadedAt: 0 };
 
-function truthy(v) {
-  if (typeof v === 'boolean') return v;
-  const s = String(v ?? '').trim().toLowerCase();
-  return s === 'true' || s === 'yes' || s === '1';
-}
-
 export async function loadLeaders() {
-  const { rows } = await readRows('_leaders');
+  const rows = await fetchActiveLeaders();
   const byId = new Map();
   for (const r of rows) {
-    const tgId = Number(r.tg_id);
-    if (!Number.isFinite(tgId) || tgId === 0) continue;
-    if (!truthy(r.active)) continue;
-    byId.set(tgId, { tgId, name: String(r.name ?? '').trim() });
+    byId.set(Number(r.tg_id), { tgId: Number(r.tg_id), name: r.name });
   }
   _cache = { byId, loadedAt: Date.now() };
   return _cache;

@@ -11,6 +11,7 @@
     "node": "18.x"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.104.1",
     "dotenv": "^16.4.5",
     "fuse.js": "^7.0.0",
     "googleapis": "^144.0.0",

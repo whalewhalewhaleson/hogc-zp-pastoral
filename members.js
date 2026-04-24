@@ -1,29 +1,18 @@
 import Fuse from 'fuse.js';
-import { readRows } from './sheets.js';
-
-const ACTIVE_ROLES = new Set(['R', 'I', 'G', 'NF']);
+import { fetchAllMembers } from './shared/supabase.js';
 
 let _members = [];
 let _fuse = null;
 let _byId = new Map();
 
 export async function loadMembers() {
-  const { rows } = await readRows('Members!A2:ZZ');
-  const namedRows = rows.filter((r) => String(r.NAME ?? r.name ?? '').trim() !== '');
-
-  let fallbackCount = 0;
-  _members = namedRows
-    .filter((r) => ACTIVE_ROLES.has(String(r.ROLE ?? r.role ?? '').trim().toUpperCase()))
-    .map((r) => {
-      const name = String(r.NAME ?? r.name ?? '').trim();
-      const rawId = String(r.members_id ?? r.member_id ?? '').trim();
-      let memberId = rawId;
-      if (!memberId) {
-        memberId = `name:${name.toLowerCase().replace(/\s+/g, '_')}`;
-        fallbackCount++;
-      }
-      return { memberId, name, role: String(r.ROLE ?? r.role ?? '').trim().toUpperCase() };
-    });
+  const rows = await fetchAllMembers(true);
+  _members = rows.map((r) => ({
+    memberId: r.id,
+    name: r.name,
+    role: r.role,
+    leaderRole: r.leader_role,
+  }));
 
   _byId = new Map(_members.map((m) => [m.memberId, m]));
   _fuse = new Fuse(_members, {
@@ -33,9 +22,7 @@ export async function loadMembers() {
     minMatchCharLength: 2,
   });
   if (_members.length === 0) {
-    console.warn('[members] 0 active members loaded — check that the Members sheet has data and roles are in ACTIVE_ROLES.');
-  } else if (fallbackCount > 0) {
-    console.warn(`[members] ${fallbackCount}/${_members.length} members using fallback IDs. Run the Apps Script in the Members sheet to generate members_id values, then /reload.`);
+    console.warn('[members] 0 active members loaded — check the members table in Supabase.');
   }
   return _members;
 }
