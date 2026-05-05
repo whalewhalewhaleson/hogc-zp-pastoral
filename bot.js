@@ -5,6 +5,9 @@ import {
   insertUpdate, getUpdate, patchUpdate, softDeleteUpdate,
   getUpdatesByMember, getRecentUpdatesByAuthor,
   countUpdatesByMember,
+  insertOuting, getOuting, patchOuting, softDeleteOuting,
+  setOutingParticipants, getOutingParticipants,
+  getOutingsByMember, getRecentOutingsByAuthor,
 } from './shared/supabase.js';
 import { isLeader, getLeaderName, reloadLeaders } from './leaders.js';
 import {
@@ -17,12 +20,13 @@ import {
 } from './members.js';
 import { toSGTIso, formatSGTDate, hoursSince } from './util/time.js';
 import { e, mono } from './util/escape.js';
-import { newUpdateId } from './util/id.js';
+import { newUpdateId, newOutingId } from './util/id.js';
 
 const EDIT_WINDOW_HOURS = 24;
 const RECENT_LIMIT = 20;
 const RECENT_PAGE_SIZE = 5;
 const PICKER_PAGE_SIZE = 20;
+const OTP_PAGE_SIZE = 8;
 const TIMELINE_PAGE_SIZE = 5;
 const NOTES_LIMIT = 30;
 
@@ -59,6 +63,20 @@ function renderNoteTitleLine(title) {
 // Display date: prefer occurred_at over created_at.
 function entryDate(r) {
   return r.occurred_at ?? r.created_at;
+}
+
+// Inline tagged-people line for outing cards.
+function buildTaggedLine(memberIds, maxShow = 3) {
+  if (!memberIds?.length) return '';
+  const names = memberIds
+    .map((id) => getMember(String(id)))
+    .filter(Boolean)
+    .map((m) => memberLabel(m));
+  if (!names.length) return '';
+  const shown = names.slice(0, maxShow);
+  const extra = names.length - maxShow;
+  const suffix = extra > 0 ? `, \\+${extra} more` : '';
+  return `_Tagged: ${shown.map(e).join(', ')}${suffix}_`;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +134,9 @@ const HELP_TEXT =
   `*ZP Pastoral Bot* 🌿\n` +
   `_Your companion for keeping pastoral notes on ZP1 members\\._\n\n` +
   `/update — write a note about a member\n` +
-  `/notes \\[name\\] — browse a member's notes\n` +
-  `/recent — your recent notes \\(tap to view, edit, or delete\\)\n` +
+  `/outing — log an outing \\(tags multiple people\\)\n` +
+  `/notes \\[name\\] — browse a member's timeline\n` +
+  `/recent — your recent entries \\(notes \\+ outings\\)\n` +
   `/cancel — back out of whatever you were doing\n` +
   `/help — show this message`;
 
@@ -148,17 +167,20 @@ bot.command('skip', async (ctx) => {
     return;
   }
 
-  if (pending.kind === 'edit_title_only') {
+  if (pending.kind === 'outing_title_input') {
+    await proceedToOutingPeoplePicker(ctx, pending.body, '');
+    return;
+  }
+
+  if (pending.kind === 'edit_title_only' ||
+      pending.kind === 'edit_body_only' ||
+      pending.kind === 'edit_outing_title' ||
+      pending.kind === 'edit_outing_body') {
     ctx.session.pending = null;
     return ctx.reply('No changes made. 😊');
   }
 
-  if (pending.kind === 'edit_body_only') {
-    ctx.session.pending = null;
-    return ctx.reply('No changes made. 😊');
-  }
-
-  if (pending.kind === 'edit_date') {
+  if (pending.kind === 'edit_date' || pending.kind === 'edit_outing_date') {
     ctx.session.pending = null;
     return ctx.reply('Date unchanged. 😊');
   }
@@ -245,8 +267,7 @@ bot.command('update', async (ctx) => {
     return ctx.reply(`Hmm, I couldn't find anyone called "${query}" 🤔 Try a slightly different spelling?`);
   }
   if (matches.length === 1) {
-    const m = matches[0];
-    return startUpdateBody(ctx, m.memberId);
+    return startUpdateBody(ctx, matches[0].memberId);
   }
   let text = `Found a few — which one? 🙂\n\n`;
   matches.forEach((m, i) => { text += `/${i + 1} ${e(memberLabel(m))}\n`; });
@@ -285,14 +306,12 @@ bot.callbackQuery(/^picker_page:(\d+)$/, async (ctx) => {
   }
 });
 
-// After content typed, show inline title prompt.
 bot.callbackQuery('add_title', async (ctx) => {
   await ctx.answerCallbackQuery();
   const pending = ctx.session.pending;
   if (!pending || pending.kind !== 'update_asking_title') {
     return ctx.reply('Nothing to add a title to right now. 😊');
   }
-  const m = getMember(pending.memberId);
   ctx.session.pending = { kind: 'update_title_input', memberId: pending.memberId, body: pending.body };
   await ctx.reply(
     `What's the title? \\(short summary\\)\n\nOr /skip to save without one\\.`,
@@ -340,7 +359,7 @@ async function saveNewUpdate(ctx, memberId, body, title) {
 }
 
 // ---------------------------------------------------------------------------
-// /1, /2, /3 … — pick from a numbered list (member only)
+// /1, /2, /3 … — pick from a numbered list
 // ---------------------------------------------------------------------------
 
 bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
@@ -366,10 +385,8 @@ bot.hears(/^\/(\d+)(@\w+)?\s*$/, async (ctx) => {
   return startUpdateBody(ctx, m.memberId);
 });
 
-
 // ---------------------------------------------------------------------------
 // /notes — browse a member's timeline (replaces /history)
-// /history is kept as a silent alias for muscle memory.
 // ---------------------------------------------------------------------------
 
 async function handleNotesCommand(ctx) {
@@ -417,20 +434,37 @@ bot.callbackQuery(/^pick_notes:(.+)$/, async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Member timeline — inline-button paginated view (notes only in Phase A)
+// Member timeline — interleaved notes + outings, inline-button navigation
 // ---------------------------------------------------------------------------
 
 async function sendMemberTimeline(ctx, memberId) {
   const member = getMember(memberId);
   if (!member) return ctx.reply('Member not found. Try /reload.');
   await showTyping(ctx);
-  const rows = await getUpdatesByMember(memberId, NOTES_LIMIT);
 
-  if (rows.length === 0) {
-    return ctx.reply(`No notes written for ${e(memberLabel(member))} yet\\. They're waiting for someone to care\\! 💛`, { parse_mode: 'MarkdownV2' });
+  const [noteRows, outingRows] = await Promise.all([
+    getUpdatesByMember(memberId, NOTES_LIMIT),
+    getOutingsByMember(memberId, NOTES_LIMIT),
+  ]);
+
+  const outingItems = await Promise.all(
+    outingRows.map(async (r) => {
+      const participants = await getOutingParticipants(r.id);
+      return { kind: 'outing', ...r, participants };
+    }),
+  );
+  const noteItems = noteRows.map((r) => ({ kind: 'note', ...r }));
+  const items = [...noteItems, ...outingItems].sort((a, b) =>
+    entryDate(b).localeCompare(entryDate(a)),
+  );
+
+  if (items.length === 0) {
+    return ctx.reply(
+      `No notes written for ${e(memberLabel(member))} yet\\. They're waiting for someone to care\\! 💛`,
+      { parse_mode: 'MarkdownV2' },
+    );
   }
 
-  const items = rows.map((r) => ({ kind: 'note', ...r }));
   ctx.session.memberTimeline = items;
   ctx.session.memberTimelineMemberId = memberId;
 
@@ -443,18 +477,20 @@ function renderTimelineList(items, offset, memberHint) {
   const rangeFrom = offset + 1;
   const rangeTo = offset + page.length;
 
+  const totalLabel = items.length === 1 ? '1 entry' : `${items.length} entries`;
   const header = memberHint
-    ? `*${e(memberLabel(memberHint))}* — ${items.length} note${items.length === 1 ? '' : 's'} 📖`
-    : `*Notes* 📖`;
+    ? `*${e(memberLabel(memberHint))}* — ${totalLabel} 📖`
+    : `*Timeline* 📖`;
 
   let text = `${header} \\(${rangeFrom}–${rangeTo}\\)\n\n`;
   page.forEach((r, i) => {
     const date = e(formatSGTDate(entryDate(r)));
     const author = e(r.author_name || String(r.author_tg_id));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+    const icon = r.kind === 'outing' ? '🚶' : '📝';
     const titleLine = r.title ? `*${e(r.title)}*\n` : '';
     const preview = e(String(r.note).slice(0, 60).replace(/\n/g, ' ') + (r.note.length > 60 ? '…' : ''));
-    text += `*${i + 1}\\.* 📝 ${date} · ${author}${edited}\n${titleLine}_${preview}_\n\n`;
+    text += `*${i + 1}\\.* ${icon} ${date} · ${author}${edited}\n${titleLine}_${preview}_\n\n`;
   });
   text += `Tap a number to open\\.`;
 
@@ -469,9 +505,37 @@ function renderTimelineList(items, offset, memberHint) {
   return { text, keyboard: kb };
 }
 
+function renderOutingDetailText(r) {
+  const date = e(formatSGTDate(entryDate(r)));
+  const author = e(r.author_name || String(r.author_tg_id));
+  const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+  const titleLine = renderNoteTitleLine(r.title);
+  const noteText = String(r.note).slice(0, 3500);
+  const truncated = r.note.length > 3500 ? '\n\n_\\[truncated\\]_' : '';
+  const tagged = buildTaggedLine(r.participants ?? [], 5);
+  return `🚶 *Outing*\n${date} · ${author}${edited}\n\n${titleLine}${e(noteText)}${truncated}${tagged ? '\n\n' + tagged : ''}`;
+}
+
 function renderTimelineDetail(items, absIdx, ctx, backOffset) {
   const r = items[absIdx];
   if (!r) return null;
+
+  if (r.kind === 'outing') {
+    const text = renderOutingDetailText(r);
+    const kb = new InlineKeyboard().text('🔙 Back', `tl_list:${backOffset}`);
+    const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
+    if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
+      kb.text('✏️ Title', `edit_outing_title:${r.id}`)
+        .text('📝 Note', `edit_outing_body:${r.id}`)
+        .row()
+        .text('📅 Date', `edit_outing_date:${r.id}`)
+        .text('👥 People', `edit_outing_people:${r.id}`)
+        .row()
+        .text('🗑 Delete', `ask_delete_outing:${r.id}`);
+    }
+    return { text, keyboard: kb };
+  }
+
   const member = getMember(String(r.member_id));
   const memberName = member ? memberLabel(member) : String(r.member_id);
   const date = e(formatSGTDate(entryDate(r)));
@@ -522,7 +586,7 @@ bot.callbackQuery(/^tl_open:(\d+)$/, async (ctx) => {
   const backOffset = Math.floor(absIdx / TIMELINE_PAGE_SIZE) * TIMELINE_PAGE_SIZE;
   const detail = renderTimelineDetail(items, absIdx, ctx, backOffset);
   if (!detail) {
-    return ctx.editMessageText(`Hmm, I couldn't find that note — run /notes to reload.`);
+    return ctx.editMessageText(`Hmm, I couldn't find that entry — run /notes to reload.`);
   }
   try {
     await ctx.editMessageText(detail.text, { parse_mode: 'MarkdownV2', reply_markup: detail.keyboard });
@@ -532,14 +596,208 @@ bot.callbackQuery(/^tl_open:(\d+)$/, async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// /recent — your recent notes (morphing list ↔ detail, one message)
+// /outing — log a group outing (content → optional title → multi-select people)
+// ---------------------------------------------------------------------------
+
+bot.command('outing', async (ctx) => {
+  ctx.session.pending = { kind: 'outing_body' };
+  return ctx.reply(
+    `What happened on this outing? 🚶\nSend a description, or /cancel\\.`,
+    { parse_mode: 'MarkdownV2' },
+  );
+});
+
+bot.callbackQuery('add_outing_title', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_asking_title') {
+    return ctx.reply('Nothing to add a title to right now. 😊');
+  }
+  ctx.session.pending = { kind: 'outing_title_input', body: pending.body };
+  await ctx.reply(
+    `What's the title? \\(short summary\\)\n\nOr /skip to save without one\\.`,
+    { parse_mode: 'MarkdownV2' },
+  );
+});
+
+bot.callbackQuery('skip_outing_title', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_asking_title') {
+    return ctx.reply('Nothing to skip right now. 😊');
+  }
+  await proceedToOutingPeoplePicker(ctx, pending.body, '');
+});
+
+function buildPeoplePickerPage(allSorted, page, memberIds) {
+  const selectedSet = new Set(memberIds);
+  const totalPages = Math.max(1, Math.ceil(allSorted.length / OTP_PAGE_SIZE));
+  const pageIdx = Math.max(0, Math.min(page, totalPages - 1));
+  const start = pageIdx * OTP_PAGE_SIZE;
+  const slice = allSorted.slice(start, start + OTP_PAGE_SIZE);
+  const count = memberIds.length;
+
+  const text =
+    `*Who was on this outing?* 👥\n` +
+    `_${count} selected_ \\(${start + 1}–${start + slice.length} of ${allSorted.length}\\)\n\n` +
+    `Toggle to tag people, then tap Done\\.`;
+
+  const kb = new InlineKeyboard();
+  for (const m of slice) {
+    const check = selectedSet.has(m.memberId) ? '☑' : '☐';
+    kb.text(`${check} ${memberLabel(m)}`, `otp_m:${m.memberId}`).row();
+  }
+  if (pageIdx > 0) kb.text('⬅️ Prev', `otp_p:${pageIdx - 1}`);
+  kb.text(`✅ Done (${count})`, 'otp_done');
+  if (pageIdx < totalPages - 1) kb.text('➡️ Next', `otp_p:${pageIdx + 1}`);
+
+  return { text, keyboard: kb };
+}
+
+async function proceedToOutingPeoplePicker(ctx, body, title, outingId = null, existingMemberIds = []) {
+  const allSorted = [...getAllMembers()].sort((a, b) => a.name.localeCompare(b.name));
+  ctx.session.pending = {
+    kind: 'outing_pick_people',
+    body, title, outingId,
+    memberIds: [...existingMemberIds],
+    allSorted, page: 0,
+  };
+  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingMemberIds);
+  return ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+}
+
+bot.callbackQuery(/^otp_m:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_pick_people') {
+    return ctx.reply('This picker has expired — start over with /outing. 😊');
+  }
+  const memberId = ctx.match[1];
+  const idx = pending.memberIds.indexOf(memberId);
+  if (idx === -1) {
+    pending.memberIds.push(memberId);
+  } else {
+    pending.memberIds.splice(idx, 1);
+  }
+  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds);
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  } catch {}
+});
+
+bot.callbackQuery(/^otp_p:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_pick_people') {
+    return ctx.reply('This picker has expired — start over with /outing. 😊');
+  }
+  pending.page = parseInt(ctx.match[1], 10);
+  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds);
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  } catch {}
+});
+
+bot.callbackQuery('otp_done', async (ctx) => {
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_pick_people') {
+    await ctx.answerCallbackQuery();
+    return ctx.reply('This picker has expired — start over with /outing. 😊');
+  }
+  if (pending.memberIds.length === 0) {
+    return ctx.answerCallbackQuery('Tag at least one person first! 😊', { show_alert: true });
+  }
+  await ctx.answerCallbackQuery();
+
+  if (pending.outingId) {
+    await saveOutingPeopleEdit(ctx, pending.outingId, pending.memberIds);
+  } else {
+    await saveNewOuting(ctx, pending.body, pending.title, pending.memberIds);
+  }
+});
+
+async function saveNewOuting(ctx, body, title, memberIds) {
+  ctx.session.pending = null;
+  await showTyping(ctx);
+  const outingId = newOutingId();
+  const authorName = (await getLeaderName(ctx.from.id)) || ctx.from.first_name || '';
+  await insertOuting({
+    id: outingId,
+    title: title || null,
+    note: body,
+    author_tg_id: ctx.from.id,
+    author_name: authorName,
+  });
+  await setOutingParticipants(outingId, memberIds);
+
+  const tagged = buildTaggedLine(memberIds, 3);
+  const titlePart = title ? ` \\(*${e(title)}*\\)` : '';
+  const text =
+    `Saved\\! 🙌 Outing${titlePart} logged\\.\n` +
+    (tagged || '_No people tagged_');
+
+  const kb = new InlineKeyboard()
+    .text('✏️ Title', `edit_outing_title:${outingId}`)
+    .text('📝 Note', `edit_outing_body:${outingId}`)
+    .row()
+    .text('📅 Date', `edit_outing_date:${outingId}`)
+    .text('👥 People', `edit_outing_people:${outingId}`)
+    .row()
+    .text('🗑 Delete', `ask_delete_outing:${outingId}`);
+
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+  } catch {
+    await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: kb });
+  }
+}
+
+async function saveOutingPeopleEdit(ctx, outingId, memberIds) {
+  ctx.session.pending = null;
+  await showTyping(ctx);
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) {
+    try { await ctx.editMessageText(gate); } catch { await ctx.reply(gate); }
+    return;
+  }
+  await setOutingParticipants(outingId, memberIds);
+  await patchOuting(outingId, { edited_at: toSGTIso() });
+  ctx.session.recentList = null;
+  ctx.session.memberTimeline = null;
+  const tagged = buildTaggedLine(memberIds, 5);
+  const text = `Done\\! People updated\\. 👥\n${tagged || '_No people tagged_'}`;
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2' });
+  } catch {
+    await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /recent — interleaved notes + outings (morphing list ↔ detail)
 // ---------------------------------------------------------------------------
 
 bot.command('recent', async (ctx) => {
   ctx.session.pending = null;
   const authorTgId = ctx.from.id;
   await showTyping(ctx);
-  const mine = await getRecentUpdatesByAuthor(authorTgId, RECENT_LIMIT);
+
+  const [noteRows, outingRows] = await Promise.all([
+    getRecentUpdatesByAuthor(authorTgId, RECENT_LIMIT),
+    getRecentOutingsByAuthor(authorTgId, RECENT_LIMIT),
+  ]);
+
+  const outingItems = await Promise.all(
+    outingRows.map(async (r) => {
+      const participants = await getOutingParticipants(r.id);
+      return { kind: 'outing', ...r, participants };
+    }),
+  );
+  const noteItems = noteRows.map((r) => ({ kind: 'note', ...r }));
+  const mine = [...noteItems, ...outingItems]
+    .sort((a, b) => entryDate(b).localeCompare(entryDate(a)))
+    .slice(0, RECENT_LIMIT);
 
   if (mine.length === 0) {
     return ctx.reply(`You haven't written any notes yet — go love on someone! 💛`);
@@ -555,15 +813,22 @@ function renderRecentList(mine, offset) {
   const rangeFrom = offset + 1;
   const rangeTo = offset + page.length;
 
-  let text = `*Your recent notes* \\(${rangeFrom}–${rangeTo} of ${mine.length}\\)\n\n`;
+  let text = `*Your recent entries* \\(${rangeFrom}–${rangeTo} of ${mine.length}\\)\n\n`;
   page.forEach((r, i) => {
-    const member = getMember(String(r.member_id));
-    const memberName = e(member ? memberLabel(member) : String(r.member_id));
     const date = e(formatSGTDate(entryDate(r)));
     const edited = r.edited_at ? ' _\\(edited\\)_' : '';
+    const icon = r.kind === 'outing' ? '🚶' : '📝';
+    let label;
+    if (r.kind === 'outing') {
+      const count = r.participants?.length ?? 0;
+      label = e(`Outing · ${count} ${count === 1 ? 'person' : 'people'}`);
+    } else {
+      const member = getMember(String(r.member_id));
+      label = e(member ? memberLabel(member) : String(r.member_id));
+    }
     const titleLine = r.title ? `*${e(r.title)}*\n` : '';
     const preview = e(String(r.note).slice(0, 80).replace(/\n/g, ' ') + (r.note.length > 80 ? '…' : ''));
-    text += `*${i + 1}\\.* 📝 *${memberName}* · ${date}${edited}\n${titleLine}_${preview}_\n\n`;
+    text += `*${i + 1}\\.* ${icon} *${label}* · ${date}${edited}\n${titleLine}_${preview}_\n\n`;
   });
   text += `Tap a number to open\\.`;
 
@@ -581,6 +846,23 @@ function renderRecentList(mine, offset) {
 function renderRecentDetail(mine, idx, ctx, backOffset) {
   const r = mine[idx];
   if (!r) return null;
+
+  if (r.kind === 'outing') {
+    const text = renderOutingDetailText(r);
+    const kb = new InlineKeyboard().text('⬅️ Back', `rec_list:${backOffset}`);
+    const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
+    if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
+      kb.text('✏️ Title', `edit_outing_title:${r.id}`)
+        .text('📝 Note', `edit_outing_body:${r.id}`)
+        .row()
+        .text('📅 Date', `edit_outing_date:${r.id}`)
+        .text('👥 People', `edit_outing_people:${r.id}`)
+        .row()
+        .text('🗑 Delete', `ask_delete_outing:${r.id}`);
+    }
+    return { text, keyboard: kb };
+  }
+
   const member = getMember(String(r.member_id));
   const memberName = member ? memberLabel(member) : String(r.member_id);
   const date = e(formatSGTDate(entryDate(r)));
@@ -628,7 +910,7 @@ bot.callbackQuery(/^rec_open:(\d+)$/, async (ctx) => {
   const backOffset = Math.floor(absIdx / RECENT_PAGE_SIZE) * RECENT_PAGE_SIZE;
   const detail = renderRecentDetail(mine, absIdx, ctx, backOffset);
   if (!detail) {
-    return ctx.editMessageText(`Hmm, I couldn't find that note — tap /recent to reload.`);
+    return ctx.editMessageText(`Hmm, I couldn't find that entry — tap /recent to reload.`);
   }
   try {
     await ctx.editMessageText(detail.text, { parse_mode: 'MarkdownV2', reply_markup: detail.keyboard });
@@ -638,7 +920,7 @@ bot.callbackQuery(/^rec_open:(\d+)$/, async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Edit — separate buttons for title / note / date
+// Edit notes — title / note / date
 // ---------------------------------------------------------------------------
 
 bot.callbackQuery(/^start_edit:(.+)$/, async (ctx) => {
@@ -714,7 +996,74 @@ bot.callbackQuery(/^edit_date:(.+)$/, async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Delete — via inline buttons only
+// Edit outings — title / note / date / people
+// ---------------------------------------------------------------------------
+
+bot.callbackQuery(/^edit_outing_title:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const outingId = ctx.match[1];
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.reply(gate);
+  const currentTitle = row.title ? `*${e(row.title)}*` : '_\\(none\\)_';
+  ctx.session.pending = { kind: 'edit_outing_title', outingId };
+  await ctx.reply(
+    `Current title: ${currentTitle}\n\nSend a new title, or /skip to keep it\\.`,
+    { parse_mode: 'MarkdownV2' },
+  );
+});
+
+bot.callbackQuery(/^edit_outing_body:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const outingId = ctx.match[1];
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.reply(gate);
+  const bodyPreview = String(row.note ?? '').slice(0, 200).replace(/\n/g, ' ') + (row.note?.length > 200 ? '…' : '');
+  ctx.session.pending = { kind: 'edit_outing_body', outingId };
+  await ctx.reply(
+    `Current note: _${e(bodyPreview)}_\n\nSend the updated note, or /skip to keep it\\.`,
+    { parse_mode: 'MarkdownV2' },
+  );
+});
+
+bot.callbackQuery(/^edit_outing_date:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const outingId = ctx.match[1];
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.reply(gate);
+  const current = e(formatSGTDate(entryDate(row)));
+  ctx.session.pending = { kind: 'edit_outing_date', outingId };
+  await ctx.reply(
+    `Current date: ${current}\n\nSend a new date \\(e\\.g\\. _2026\\-05\\-01_ or _today_\\), or /skip to keep it\\.`,
+    { parse_mode: 'MarkdownV2' },
+  );
+});
+
+bot.callbackQuery(/^edit_outing_people:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const outingId = ctx.match[1];
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.reply(gate);
+  const existingIds = await getOutingParticipants(outingId);
+  const allSorted = [...getAllMembers()].sort((a, b) => a.name.localeCompare(b.name));
+  ctx.session.pending = {
+    kind: 'outing_pick_people',
+    body: row.note,
+    title: row.title,
+    outingId,
+    memberIds: existingIds,
+    allSorted,
+    page: 0,
+  };
+  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingIds);
+  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+});
+
+// ---------------------------------------------------------------------------
+// Delete — notes
 // ---------------------------------------------------------------------------
 
 bot.callbackQuery(/^ask_delete:(.+)$/, async (ctx) => {
@@ -754,6 +1103,42 @@ bot.callbackQuery(/^confirm_delete:(.+)$/, async (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
+// Delete — outings
+// ---------------------------------------------------------------------------
+
+bot.callbackQuery(/^ask_delete_outing:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const outingId = ctx.match[1];
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.reply(gate);
+  const kb = new InlineKeyboard()
+    .text('Yes, delete', `confirm_delete_outing:${outingId}`)
+    .text('Cancel', `cancel_delete_outing:${outingId}`);
+  await ctx.reply(`Remove this outing? 🗑\nThis is a soft\\-delete — Wilson can recover it from Supabase if needed\\.`, {
+    parse_mode: 'MarkdownV2',
+    reply_markup: kb,
+  });
+});
+
+bot.callbackQuery(/^cancel_delete_outing:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery('No worries!');
+  await ctx.editMessageText('No worries, outing is still there! 🙂');
+});
+
+bot.callbackQuery(/^confirm_delete_outing:(.+)$/, async (ctx) => {
+  const outingId = ctx.match[1];
+  await ctx.answerCallbackQuery();
+  await showTyping(ctx);
+  const row = await findOutingRow(outingId);
+  const gate = checkOutingEditGate(ctx, row);
+  if (gate) return ctx.editMessageText(gate);
+  await softDeleteOuting(outingId, toSGTIso());
+  ctx.session.recentList = null;
+  await ctx.editMessageText(`Done — that outing has been removed. 🗑\nWilson can recover it from Supabase if needed.`);
+});
+
+// ---------------------------------------------------------------------------
 // Text message handler — completes pending flows
 // ---------------------------------------------------------------------------
 
@@ -767,13 +1152,17 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply(`Use /1, /2 etc. to pick from the list, or /cancel to back out. 😊`);
   }
 
-  if (pending.kind === 'update_asking_title') {
+  if (pending.kind === 'update_asking_title' || pending.kind === 'outing_asking_title') {
     return ctx.reply(`Tap *Add title* or *Skip* above to continue, or /cancel\\.`, { parse_mode: 'MarkdownV2' });
+  }
+
+  if (pending.kind === 'outing_pick_people') {
+    return ctx.reply(`Use the buttons above to select people, then tap ✅ Done\\. Or /cancel to back out\\.`, { parse_mode: 'MarkdownV2' });
   }
 
   const raw = ctx.message.text.trim();
 
-  // Step 1 of /update: receive content, prompt for optional title.
+  // /update step 1: receive content, prompt for optional title.
   if (pending.kind === 'update_body') {
     const member = getMember(pending.memberId);
     if (!member) {
@@ -789,7 +1178,7 @@ bot.on('message:text', async (ctx) => {
     );
   }
 
-  // Step 2 of /update (if Add title was tapped): receive title, save.
+  // /update step 2: receive title, save.
   if (pending.kind === 'update_title_input') {
     const title = normalizeTitle(raw);
     if (!title) return ctx.reply(`That title looks empty — try again, or /skip to save without one. 😊`);
@@ -797,7 +1186,26 @@ bot.on('message:text', async (ctx) => {
     return;
   }
 
-  // Edit title only.
+  // /outing step 1: receive content.
+  if (pending.kind === 'outing_body') {
+    if (!raw) return ctx.reply(`Looks like that was empty — nothing saved. Try again, or /cancel. 😊`);
+    ctx.session.pending = { kind: 'outing_asking_title', body: raw };
+    const kb = new InlineKeyboard().text('📌 Add title', 'add_outing_title').text('Skip →', 'skip_outing_title');
+    return ctx.reply(
+      `Description received\\! Want to add a title\\?`,
+      { parse_mode: 'MarkdownV2', reply_markup: kb },
+    );
+  }
+
+  // /outing step 2: receive title, proceed to people picker.
+  if (pending.kind === 'outing_title_input') {
+    const title = normalizeTitle(raw);
+    if (!title) return ctx.reply(`That title looks empty — try again, or /skip to save without one. 😊`);
+    await proceedToOutingPeoplePicker(ctx, pending.body, title);
+    return;
+  }
+
+  // Edit note title.
   if (pending.kind === 'edit_title_only') {
     const newTitle = normalizeTitle(raw);
     if (!newTitle) return ctx.reply(`That title looks empty — try again, or /skip to keep the old one. 😊`);
@@ -811,7 +1219,7 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply(`Done\\! Title updated\\. ✏️`, { parse_mode: 'MarkdownV2' });
   }
 
-  // Edit note body only.
+  // Edit note body.
   if (pending.kind === 'edit_body_only') {
     if (!raw) return ctx.reply(`Looks like that was empty — try again, or /skip. 😊`);
     ctx.session.pending = null;
@@ -824,11 +1232,9 @@ bot.on('message:text', async (ctx) => {
     return ctx.reply(`Done\\! Note updated\\. ✏️`, { parse_mode: 'MarkdownV2' });
   }
 
-  // Edit date.
+  // Edit note date.
   if (pending.kind === 'edit_date') {
-    const parsed = raw.toLowerCase() === 'today'
-      ? new Date()
-      : new Date(raw);
+    const parsed = raw.toLowerCase() === 'today' ? new Date() : new Date(raw);
     if (isNaN(parsed.getTime())) {
       return ctx.reply(`Hmm, I couldn't parse that date 😕 Try a format like _2026\\-05\\-01_ or just _today_\\.`, { parse_mode: 'MarkdownV2' });
     }
@@ -838,6 +1244,50 @@ bot.on('message:text', async (ctx) => {
     const gate = checkEditGate(ctx, row);
     if (gate) return ctx.reply(gate);
     await patchUpdate(row.id, { occurred_at: parsed.toISOString(), edited_at: toSGTIso() });
+    ctx.session.recentList = null;
+    ctx.session.memberTimeline = null;
+    return ctx.reply(`Done\\! Date updated\\. 📅`, { parse_mode: 'MarkdownV2' });
+  }
+
+  // Edit outing title.
+  if (pending.kind === 'edit_outing_title') {
+    const newTitle = normalizeTitle(raw);
+    if (!newTitle) return ctx.reply(`That title looks empty — try again, or /skip to keep the old one. 😊`);
+    ctx.session.pending = null;
+    await showTyping(ctx);
+    const row = await findOutingRow(pending.outingId);
+    const gate = checkOutingEditGate(ctx, row);
+    if (gate) return ctx.reply(gate);
+    await patchOuting(row.id, { title: newTitle, edited_at: toSGTIso() });
+    ctx.session.recentList = null;
+    return ctx.reply(`Done\\! Title updated\\. ✏️`, { parse_mode: 'MarkdownV2' });
+  }
+
+  // Edit outing body.
+  if (pending.kind === 'edit_outing_body') {
+    if (!raw) return ctx.reply(`Looks like that was empty — try again, or /skip. 😊`);
+    ctx.session.pending = null;
+    await showTyping(ctx);
+    const row = await findOutingRow(pending.outingId);
+    const gate = checkOutingEditGate(ctx, row);
+    if (gate) return ctx.reply(gate);
+    await patchOuting(row.id, { note: raw, edited_at: toSGTIso() });
+    ctx.session.recentList = null;
+    return ctx.reply(`Done\\! Note updated\\. ✏️`, { parse_mode: 'MarkdownV2' });
+  }
+
+  // Edit outing date.
+  if (pending.kind === 'edit_outing_date') {
+    const parsed = raw.toLowerCase() === 'today' ? new Date() : new Date(raw);
+    if (isNaN(parsed.getTime())) {
+      return ctx.reply(`Hmm, I couldn't parse that date 😕 Try a format like _2026\\-05\\-01_ or just _today_\\.`, { parse_mode: 'MarkdownV2' });
+    }
+    ctx.session.pending = null;
+    await showTyping(ctx);
+    const row = await findOutingRow(pending.outingId);
+    const gate = checkOutingEditGate(ctx, row);
+    if (gate) return ctx.reply(gate);
+    await patchOuting(row.id, { occurred_at: parsed.toISOString(), edited_at: toSGTIso() });
     ctx.session.recentList = null;
     ctx.session.memberTimeline = null;
     return ctx.reply(`Done\\! Date updated\\. 📅`, { parse_mode: 'MarkdownV2' });
@@ -852,6 +1302,10 @@ async function findUpdateRow(updateId) {
   return getUpdate(updateId);
 }
 
+async function findOutingRow(outingId) {
+  return getOuting(outingId);
+}
+
 function checkEditGate(ctx, row) {
   if (!row) return `I couldn't find that note — it may have already been removed.`;
   if (row.deleted_at) return `That note has already been deleted. 🗑`;
@@ -860,6 +1314,18 @@ function checkEditGate(ctx, row) {
   }
   if (hoursSince(row.created_at) >= EDIT_WINDOW_HOURS) {
     return `The ${EDIT_WINDOW_HOURS}h edit window has passed. Just write a new note instead! 😊`;
+  }
+  return null;
+}
+
+function checkOutingEditGate(ctx, row) {
+  if (!row) return `I couldn't find that outing — it may have already been removed.`;
+  if (row.deleted_at) return `That outing has already been deleted. 🗑`;
+  if (String(row.author_tg_id) !== String(ctx.from.id)) {
+    return `You can only edit or delete outings you logged yourself. 😊`;
+  }
+  if (hoursSince(row.created_at) >= EDIT_WINDOW_HOURS) {
+    return `The ${EDIT_WINDOW_HOURS}h edit window has passed. 😊`;
   }
   return null;
 }

@@ -94,6 +94,84 @@ export async function getLatestUpdatePerMember(limit = 10) {
     .map(([memberId]) => memberId);
 }
 
+// --- Outings ---
+
+export async function insertOuting(data) {
+  const { error } = await supabase.from('outings').insert(data);
+  if (error) throw new Error(`insertOuting: ${error.message}`);
+}
+
+export async function getOuting(outingId) {
+  const { data, error } = await supabase
+    .from('outings')
+    .select('*')
+    .eq('id', outingId)
+    .single();
+  if (error && error.code !== 'PGRST116') throw new Error(`getOuting: ${error.message}`);
+  return data ?? null;
+}
+
+export async function patchOuting(outingId, fields) {
+  const { error } = await supabase.from('outings').update(fields).eq('id', outingId);
+  if (error) throw new Error(`patchOuting: ${error.message}`);
+}
+
+export async function softDeleteOuting(outingId, deletedAt) {
+  return patchOuting(outingId, { deleted_at: deletedAt });
+}
+
+export async function setOutingParticipants(outingId, memberIds) {
+  const { error: delError } = await supabase
+    .from('outing_participants')
+    .delete()
+    .eq('outing_id', outingId);
+  if (delError) throw new Error(`setOutingParticipants delete: ${delError.message}`);
+  if (!memberIds.length) return;
+  const rows = memberIds.map((mid) => ({ outing_id: outingId, member_id: mid }));
+  const { error } = await supabase.from('outing_participants').insert(rows);
+  if (error) throw new Error(`setOutingParticipants insert: ${error.message}`);
+}
+
+export async function getOutingParticipants(outingId) {
+  const { data, error } = await supabase
+    .from('outing_participants')
+    .select('member_id')
+    .eq('outing_id', outingId);
+  if (error) throw new Error(`getOutingParticipants: ${error.message}`);
+  return data.map((p) => p.member_id);
+}
+
+export async function getOutingsByMember(memberId, limit = 20) {
+  const { data: parts, error: e1 } = await supabase
+    .from('outing_participants')
+    .select('outing_id')
+    .eq('member_id', memberId);
+  if (e1) throw new Error(`getOutingsByMember: ${e1.message}`);
+  if (!parts?.length) return [];
+  const ids = parts.map((p) => p.outing_id);
+  const { data, error } = await supabase
+    .from('outings')
+    .select('*')
+    .in('id', ids)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`getOutingsByMember: ${error.message}`);
+  return data;
+}
+
+export async function getRecentOutingsByAuthor(authorTgId, limit = 20) {
+  const { data, error } = await supabase
+    .from('outings')
+    .select('*')
+    .eq('author_tg_id', authorTgId)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`getRecentOutingsByAuthor: ${error.message}`);
+  return data;
+}
+
 // --- Members ---
 
 export async function fetchAllMembers(activeOnly = true) {
