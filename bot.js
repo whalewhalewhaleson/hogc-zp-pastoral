@@ -7,7 +7,7 @@ import {
   countUpdatesByMember,
   insertOuting, getOuting, patchOuting, softDeleteOuting,
   setOutingParticipants, getOutingParticipants,
-  getOutingsByMember, getRecentOutingsByAuthor,
+  getOutingsByMember, getRecentOutingsByAuthor, getRecentOutings,
 } from './shared/supabase.js';
 import { isLeader, getLeaderName, reloadLeaders } from './leaders.js';
 import {
@@ -135,6 +135,7 @@ const HELP_TEXT =
   `_Your companion for keeping pastoral notes on ZP1 members\\._\n\n` +
   `/update — write a note about a member\n` +
   `/outing — log an outing \\(tags multiple people\\)\n` +
+  `/outings — browse all recent outings\n` +
   `/notes \\[name\\] — browse a member's timeline\n` +
   `/recent — your recent entries \\(notes \\+ outings\\)\n` +
   `/cancel — back out of whatever you were doing\n` +
@@ -526,7 +527,7 @@ function renderTimelineDetail(items, absIdx, ctx, backOffset) {
     const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
     if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
       kb.text('✏️ Title', `edit_outing_title:${r.id}`)
-        .text('📝 Note', `edit_outing_body:${r.id}`)
+        .text('📝 Update', `edit_outing_body:${r.id}`)
         .row()
         .text('📅 Date', `edit_outing_date:${r.id}`)
         .text('👥 People', `edit_outing_people:${r.id}`)
@@ -629,27 +630,42 @@ bot.callbackQuery('skip_outing_title', async (ctx) => {
   await proceedToOutingPeoplePicker(ctx, pending.body, '');
 });
 
-function buildPeoplePickerPage(allSorted, page, memberIds) {
+function buildPeoplePickerPage(allSorted, page, memberIds, searchQuery = '') {
   const selectedSet = new Set(memberIds);
-  const totalPages = Math.max(1, Math.ceil(allSorted.length / OTP_PAGE_SIZE));
-  const pageIdx = Math.max(0, Math.min(page, totalPages - 1));
-  const start = pageIdx * OTP_PAGE_SIZE;
-  const slice = allSorted.slice(start, start + OTP_PAGE_SIZE);
   const count = memberIds.length;
+
+  let slice, rangeInfo;
+  let pageIdx = 0;
+
+  if (searchQuery) {
+    slice = searchMembers(searchQuery, 30);
+    rangeInfo = `_${slice.length} result${slice.length === 1 ? '' : 's'} for "${searchQuery}"_`;
+  } else {
+    const totalPages = Math.max(1, Math.ceil(allSorted.length / OTP_PAGE_SIZE));
+    pageIdx = Math.max(0, Math.min(page, totalPages - 1));
+    const start = pageIdx * OTP_PAGE_SIZE;
+    slice = allSorted.slice(start, start + OTP_PAGE_SIZE);
+    rangeInfo = `\\(${start + 1}–${start + slice.length} of ${allSorted.length}\\)`;
+  }
 
   const text =
     `*Who was on this outing?* 👥\n` +
-    `_${count} selected_ \\(${start + 1}–${start + slice.length} of ${allSorted.length}\\)\n\n` +
-    `Toggle to tag people, then tap Done\\.`;
+    `_${count} selected_ · ${rangeInfo}\n\n` +
+    `Type a name to search, or scroll the list\\.`;
 
   const kb = new InlineKeyboard();
   for (const m of slice) {
     const check = selectedSet.has(m.memberId) ? '☑' : '☐';
     kb.text(`${check} ${memberLabel(m)}`, `otp_m:${m.memberId}`).row();
   }
-  if (pageIdx > 0) kb.text('⬅️ Prev', `otp_p:${pageIdx - 1}`);
-  kb.text(`✅ Done (${count})`, 'otp_done');
-  if (pageIdx < totalPages - 1) kb.text('➡️ Next', `otp_p:${pageIdx + 1}`);
+
+  if (searchQuery) {
+    kb.text('❌ Clear search', 'otp_clear').text(`✅ Done (${count})`, 'otp_done');
+  } else {
+    if (pageIdx > 0) kb.text('⬅️ Prev', `otp_p:${pageIdx - 1}`);
+    kb.text(`✅ Done (${count})`, 'otp_done');
+    if (pageIdx < Math.ceil(allSorted.length / OTP_PAGE_SIZE) - 1) kb.text('➡️ Next', `otp_p:${pageIdx + 1}`);
+  }
 
   return { text, keyboard: kb };
 }
@@ -660,9 +676,9 @@ async function proceedToOutingPeoplePicker(ctx, body, title, outingId = null, ex
     kind: 'outing_pick_people',
     body, title, outingId,
     memberIds: [...existingMemberIds],
-    allSorted, page: 0,
+    allSorted, page: 0, searchQuery: '',
   };
-  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingMemberIds);
+  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingMemberIds, '');
   return ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
 }
 
@@ -679,7 +695,7 @@ bot.callbackQuery(/^otp_m:(.+)$/, async (ctx) => {
   } else {
     pending.memberIds.splice(idx, 1);
   }
-  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds);
+  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds, pending.searchQuery ?? '');
   try {
     await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
   } catch {}
@@ -692,7 +708,20 @@ bot.callbackQuery(/^otp_p:(\d+)$/, async (ctx) => {
     return ctx.reply('This picker has expired — start over with /outing. 😊');
   }
   pending.page = parseInt(ctx.match[1], 10);
-  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds);
+  pending.searchQuery = '';
+  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, pending.page, pending.memberIds, '');
+  try {
+    await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+  } catch {}
+});
+
+bot.callbackQuery('otp_clear', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const pending = ctx.session.pending;
+  if (!pending || pending.kind !== 'outing_pick_people') return;
+  pending.searchQuery = '';
+  pending.page = 0;
+  const { text, keyboard } = buildPeoplePickerPage(pending.allSorted, 0, pending.memberIds, '');
   try {
     await ctx.editMessageText(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
   } catch {}
@@ -738,7 +767,7 @@ async function saveNewOuting(ctx, body, title, memberIds) {
 
   const kb = new InlineKeyboard()
     .text('✏️ Title', `edit_outing_title:${outingId}`)
-    .text('📝 Note', `edit_outing_body:${outingId}`)
+    .text('📝 Update', `edit_outing_body:${outingId}`)
     .row()
     .text('📅 Date', `edit_outing_date:${outingId}`)
     .text('👥 People', `edit_outing_people:${outingId}`)
@@ -773,6 +802,28 @@ async function saveOutingPeopleEdit(ctx, outingId, memberIds) {
     await ctx.reply(text, { parse_mode: 'MarkdownV2' });
   }
 }
+
+// ---------------------------------------------------------------------------
+// /outings — browse all recent outings (any author)
+// ---------------------------------------------------------------------------
+
+bot.command('outings', async (ctx) => {
+  ctx.session.pending = null;
+  await showTyping(ctx);
+  const outingRows = await getRecentOutings(RECENT_LIMIT);
+  const outingItems = await Promise.all(
+    outingRows.map(async (r) => {
+      const participants = await getOutingParticipants(r.id);
+      return { kind: 'outing', ...r, participants };
+    }),
+  );
+  if (outingItems.length === 0) {
+    return ctx.reply(`No outings logged yet — use /outing to add one! 🚶`);
+  }
+  ctx.session.recentList = outingItems;
+  const { text, keyboard } = renderRecentList(outingItems, 0);
+  await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+});
 
 // ---------------------------------------------------------------------------
 // /recent — interleaved notes + outings (morphing list ↔ detail)
@@ -853,7 +904,7 @@ function renderRecentDetail(mine, idx, ctx, backOffset) {
     const withinWindow = hoursSince(r.created_at) < EDIT_WINDOW_HOURS;
     if (withinWindow && String(r.author_tg_id) === String(ctx.from.id)) {
       kb.text('✏️ Title', `edit_outing_title:${r.id}`)
-        .text('📝 Note', `edit_outing_body:${r.id}`)
+        .text('📝 Update', `edit_outing_body:${r.id}`)
         .row()
         .text('📅 Date', `edit_outing_date:${r.id}`)
         .text('👥 People', `edit_outing_people:${r.id}`)
@@ -990,7 +1041,7 @@ bot.callbackQuery(/^edit_date:(.+)$/, async (ctx) => {
   const current = e(formatSGTDate(entryDate(row)));
   ctx.session.pending = { kind: 'edit_date', updateId };
   await ctx.reply(
-    `Current date: ${current}\n\nSend a new date \\(e\\.g\\. _2026\\-05\\-01_ or _today_\\), or /skip to keep it\\.`,
+    `Current date: ${current}\n\nSend a new date \\(format: _YYYY\\-MM\\-DD_, e\\.g\\. _2026\\-05\\-06_\\) or just _today_\\. /skip to keep it\\.`,
     { parse_mode: 'MarkdownV2' },
   );
 });
@@ -1036,7 +1087,7 @@ bot.callbackQuery(/^edit_outing_date:(.+)$/, async (ctx) => {
   const current = e(formatSGTDate(entryDate(row)));
   ctx.session.pending = { kind: 'edit_outing_date', outingId };
   await ctx.reply(
-    `Current date: ${current}\n\nSend a new date \\(e\\.g\\. _2026\\-05\\-01_ or _today_\\), or /skip to keep it\\.`,
+    `Current date: ${current}\n\nSend a new date \\(format: _YYYY\\-MM\\-DD_, e\\.g\\. _2026\\-05\\-06_\\) or just _today_\\. /skip to keep it\\.`,
     { parse_mode: 'MarkdownV2' },
   );
 });
@@ -1056,9 +1107,9 @@ bot.callbackQuery(/^edit_outing_people:(.+)$/, async (ctx) => {
     outingId,
     memberIds: existingIds,
     allSorted,
-    page: 0,
+    page: 0, searchQuery: '',
   };
-  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingIds);
+  const { text, keyboard } = buildPeoplePickerPage(allSorted, 0, existingIds, '');
   await ctx.reply(text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
 });
 
@@ -1157,7 +1208,12 @@ bot.on('message:text', async (ctx) => {
   }
 
   if (pending.kind === 'outing_pick_people') {
-    return ctx.reply(`Use the buttons above to select people, then tap ✅ Done\\. Or /cancel to back out\\.`, { parse_mode: 'MarkdownV2' });
+    const query = ctx.message.text.trim();
+    if (!query) return ctx.reply(`Type a name to search, or use the buttons above. /cancel to exit.`);
+    pending.searchQuery = query;
+    pending.page = 0;
+    const { text: ptxt, keyboard: pkb } = buildPeoplePickerPage(pending.allSorted, 0, pending.memberIds, query);
+    return ctx.reply(ptxt, { parse_mode: 'MarkdownV2', reply_markup: pkb });
   }
 
   const raw = ctx.message.text.trim();
@@ -1236,7 +1292,7 @@ bot.on('message:text', async (ctx) => {
   if (pending.kind === 'edit_date') {
     const parsed = raw.toLowerCase() === 'today' ? new Date() : new Date(raw);
     if (isNaN(parsed.getTime())) {
-      return ctx.reply(`Hmm, I couldn't parse that date 😕 Try a format like _2026\\-05\\-01_ or just _today_\\.`, { parse_mode: 'MarkdownV2' });
+      return ctx.reply(`Hmm, I couldn't parse that date 😕 Use _YYYY\\-MM\\-DD_ \\(e\\.g\\. _2026\\-05\\-06_\\) or just _today_\\.`, { parse_mode: 'MarkdownV2' });
     }
     ctx.session.pending = null;
     await showTyping(ctx);
@@ -1280,7 +1336,7 @@ bot.on('message:text', async (ctx) => {
   if (pending.kind === 'edit_outing_date') {
     const parsed = raw.toLowerCase() === 'today' ? new Date() : new Date(raw);
     if (isNaN(parsed.getTime())) {
-      return ctx.reply(`Hmm, I couldn't parse that date 😕 Try a format like _2026\\-05\\-01_ or just _today_\\.`, { parse_mode: 'MarkdownV2' });
+      return ctx.reply(`Hmm, I couldn't parse that date 😕 Use _YYYY\\-MM\\-DD_ \\(e\\.g\\. _2026\\-05\\-06_\\) or just _today_\\.`, { parse_mode: 'MarkdownV2' });
     }
     ctx.session.pending = null;
     await showTyping(ctx);

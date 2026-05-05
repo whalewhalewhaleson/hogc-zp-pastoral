@@ -172,6 +172,17 @@ export async function getRecentOutingsByAuthor(authorTgId, limit = 20) {
   return data;
 }
 
+export async function getRecentOutings(limit = 20) {
+  const { data, error } = await supabase
+    .from('outings')
+    .select('*')
+    .is('deleted_at', null)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`getRecentOutings: ${error.message}`);
+  return data;
+}
+
 // --- Members ---
 
 export async function fetchAllMembers(activeOnly = true) {
