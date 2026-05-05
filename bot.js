@@ -135,7 +135,7 @@ const HELP_TEXT =
   `_Your companion for keeping pastoral notes on ZP1 members\\._\n\n` +
   `/update — write a note about a member\n` +
   `/outing — log an outing \\(tags multiple people\\)\n` +
-  `/outings — browse all recent outings\n` +
+  `/outinglog — browse all recent outings\n` +
   `/notes \\[name\\] — browse a member's timeline\n` +
   `/recent — your recent entries \\(notes \\+ outings\\)\n` +
   `/cancel — back out of whatever you were doing\n` +
@@ -807,7 +807,7 @@ async function saveOutingPeopleEdit(ctx, outingId, memberIds) {
 // /outings — browse all recent outings (any author)
 // ---------------------------------------------------------------------------
 
-bot.command('outings', async (ctx) => {
+bot.command('outinglog', async (ctx) => {
   ctx.session.pending = null;
   await showTyping(ctx);
   const outingRows = await getRecentOutings(RECENT_LIMIT);
