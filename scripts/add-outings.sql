@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS outings (
 
 CREATE TABLE IF NOT EXISTS outing_participants (
   outing_id  text references outings(id)  on delete cascade,
-  member_id  text references members(id)  on delete cascade,
+  member_id  uuid references members(id)  on delete cascade,
   primary key (outing_id, member_id)
 );
 
