@@ -5,6 +5,7 @@ credentials.json
 *.json
 !package.json
 !package-lock.json
+!tsconfig.json
 *.log
 .DS_Store
 .claude/
