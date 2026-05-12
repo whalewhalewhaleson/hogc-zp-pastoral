@@ -111,8 +111,7 @@ bot.use(async (ctx, next) => {
   if (!tgId) return;
   if (await isLeader(tgId)) return next();
 
-  const username = ctx.from.username ? `@${ctx.from.username}` : '(no username)';
-  console.log(`[auth] rejected tg_id=${tgId} username=${username} name="${ctx.from.first_name ?? ''} ${ctx.from.last_name ?? ''}"`);
+  console.log(`[auth] rejected tg_id=${tgId}`);
 
   if (ctx.message?.text?.split(' ')[0] === '/start') {
     await handleUnregisteredStart(ctx);
@@ -138,7 +137,9 @@ const HELP_TEXT =
   `/outinglog — browse all recent outings\n` +
   `/notes \\[name\\] — browse a member's timeline\n` +
   `/recent — your recent entries \\(notes \\+ outings\\)\n` +
+  `/skip — skip an optional step \\(e\\.g\\. adding a title\\)\n` +
   `/cancel — back out of whatever you were doing\n` +
+  `/reload — refresh member and leader lists\n` +
   `/help — show this message`;
 
 bot.command('start', async (ctx) => {
@@ -639,7 +640,7 @@ function buildPeoplePickerPage(allSorted, page, memberIds, searchQuery = '') {
 
   if (searchQuery) {
     slice = searchMembers(searchQuery, 30);
-    rangeInfo = `_${slice.length} result${slice.length === 1 ? '' : 's'} for "${searchQuery}"_`;
+    rangeInfo = `_${slice.length} result${slice.length === 1 ? '' : 's'} for "${e(searchQuery)}"_`;
   } else {
     const totalPages = Math.max(1, Math.ceil(allSorted.length / OTP_PAGE_SIZE));
     pageIdx = Math.max(0, Math.min(page, totalPages - 1));
@@ -1390,8 +1391,11 @@ function checkOutingEditGate(ctx, row) {
 // Start
 // ---------------------------------------------------------------------------
 
-bot.catch((err) => {
-  console.error('[bot error]', err);
+bot.catch(async (err) => {
+  console.error('[bot error]', err.error ?? err);
+  try {
+    await err.ctx?.reply('Something went wrong on my end — please try again in a moment. 😕');
+  } catch {}
 });
 
 console.log('Pastoral bot starting…');

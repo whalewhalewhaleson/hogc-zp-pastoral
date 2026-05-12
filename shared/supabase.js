@@ -75,25 +75,6 @@ export async function countUpdatesByMember() {
   return counts;
 }
 
-export async function getLatestUpdatePerMember(limit = 10) {
-  const { data, error } = await supabase
-    .from('updates')
-    .select('member_id, created_at')
-    .is('deleted_at', null)
-    .order('created_at', { ascending: false });
-  if (error) throw new Error(`getLatestUpdatePerMember: ${error.message}`);
-  const seen = new Map();
-  for (const row of data) {
-    if (!seen.has(row.member_id)) {
-      seen.set(row.member_id, row.created_at);
-      if (seen.size >= limit) break;
-    }
-  }
-  return [...seen.entries()]
-    .sort((a, b) => b[1].localeCompare(a[1]))
-    .map(([memberId]) => memberId);
-}
-
 // --- Outings ---
 
 export async function insertOuting(data) {
